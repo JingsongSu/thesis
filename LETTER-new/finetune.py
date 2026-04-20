@@ -65,7 +65,6 @@ def train(args):
         coarse_loss_weight=args.coarse_loss_weight,
         fine_loss_weight=args.fine_loss_weight,
         coarse_align_weight=args.coarse_align_weight,
-        curriculum_warmup_steps=args.curriculum_warmup_steps,
     )
     model.to(device)
 
@@ -132,7 +131,6 @@ if __name__ == "__main__":
     parser.add_argument("--coarse_loss_weight", type=float, default=1.0)
     parser.add_argument("--fine_loss_weight", type=float, default=1.0)
     parser.add_argument("--coarse_align_weight", type=float, default=2.0)
-    parser.add_argument("--curriculum_warmup_steps", type=int, default=10000)
 
     args = parser.parse_args()
 

@@ -518,8 +518,8 @@ def test(args):
             coarse_loss_weight=1.0,
             fine_loss_weight=1.0,
             coarse_align_weight=1.0,
-            curriculum_warmup_steps=0,
         )
+
 
     model.to(device)
     model.eval()

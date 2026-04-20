@@ -17,9 +17,6 @@ class LETTER(T5ForConditionalGeneration):
         self.coarse_loss_weight = 1.0
         self.fine_loss_weight = 1.0
         self.coarse_align_weight = 2.0
-        self.curriculum_warmup_steps = 10000
-
-        self.register_buffer("_train_step", torch.zeros((), dtype=torch.long), persistent=False)
 
         d_model = config.d_model
         vocab_size = config.vocab_size
@@ -77,13 +74,11 @@ class LETTER(T5ForConditionalGeneration):
         coarse_loss_weight=1.0,
         fine_loss_weight=1.0,
         coarse_align_weight=2.0,
-        curriculum_warmup_steps=10000,
     ):
         self.temperature = temperature
         self.coarse_loss_weight = coarse_loss_weight
         self.fine_loss_weight = fine_loss_weight
         self.coarse_align_weight = coarse_align_weight
-        self.curriculum_warmup_steps = curriculum_warmup_steps
 
     def _masked_ce_loss(self, logits, labels):
         loss_fct = CrossEntropyLoss(ignore_index=-100)
@@ -113,31 +108,21 @@ class LETTER(T5ForConditionalGeneration):
     def _gold_coarse_embedding(self, coarse_ids):
         return self.shared(coarse_ids)
 
-    def _curriculum_pred_ratio(self):
+    def _mask_pred_coarse_embedding(self, pred_emb, active_mask=None):
         """
-        课程学习：从 gold coarse -> pred coarse
-        step=0 时 pred_ratio=0，warmup 结束后 pred_ratio=1
+        始终使用 pred coarse embedding；
+        对 padding 位置替换成 pad embedding
         """
-        if (not self.training) or self.curriculum_warmup_steps <= 0:
-            return 1.0
-        step = int(self._train_step.item())
-        return min(1.0, float(step) / float(self.curriculum_warmup_steps))
+        if active_mask is None:
+            return pred_emb
 
-    def _blend_coarse_embedding(self, pred_emb, gold_emb, active_mask=None):
-        """
-        训练时：gold -> pred 逐步过渡
-        """
-        pred_ratio = self._curriculum_pred_ratio()
-        mixed = gold_emb * (1.0 - pred_ratio) + pred_emb * pred_ratio
+        pad_id = self.config.pad_token_id
+        if pad_id is None:
+            pad_id = 0
 
-        if active_mask is not None:
-            pad_id = self.config.pad_token_id
-            if pad_id is None:
-                pad_id = 0
-            pad_emb = self.shared.weight[pad_id].view(1, -1).to(device=mixed.device, dtype=mixed.dtype)
-            mixed = torch.where(active_mask.unsqueeze(-1), mixed, pad_emb)
-
-        return mixed
+        pad_emb = self.shared.weight[pad_id].view(1, -1).to(device=pred_emb.device, dtype=pred_emb.dtype)
+        pred_emb = torch.where(active_mask.unsqueeze(-1), pred_emb, pad_emb)
+        return pred_emb
 
     def _inject_coarse(self, hidden_after_coarse, coarse_emb):
         """
@@ -292,25 +277,19 @@ class LETTER(T5ForConditionalGeneration):
             active_mask = fine_labels[:, t].ne(-100)
 
             # 1) coarse prediction
-            coarse_logits_t = self.coarse_head(last_hidden)                 # [B, V]
+            coarse_logits_t = self.coarse_head(last_hidden)                   # [B, V]
             pred_coarse_emb_t = self._soft_coarse_embedding(coarse_logits_t)  # [B, D]
 
-            # 2) gold coarse embedding
+            # 2) gold coarse embedding（只用于对齐损失，不再参与 curriculum）
             gold_coarse_ids_t = coarse_labels[:, t].clone()
             gold_coarse_ids_t[gold_coarse_ids_t == -100] = self.config.pad_token_id
             gold_coarse_emb_t = self._gold_coarse_embedding(gold_coarse_ids_t)  # [B, D]
 
-            # 3) curriculum mix: easy -> hard
-            if self.training:
-                coarse_emb_t = self._blend_coarse_embedding(
-                    pred_emb=pred_coarse_emb_t,
-                    gold_emb=gold_coarse_emb_t,
-                    active_mask=active_mask,
-                )
-            else:
-                pad_id = self.config.pad_token_id if self.config.pad_token_id is not None else 0
-                pad_emb = self.shared.weight[pad_id].view(1, -1).to(device=device, dtype=pred_coarse_emb_t.dtype)
-                coarse_emb_t = torch.where(active_mask.unsqueeze(-1), pred_coarse_emb_t, pad_emb)
+            # 3) 始终使用 pred coarse latent
+            coarse_emb_t = self._mask_pred_coarse_embedding(
+                pred_emb=pred_coarse_emb_t,
+                active_mask=active_mask,
+            )
 
             # 4) coarse latent -> decoder step
             hidden_after_coarse, past_key_values = self._decoder_step(
@@ -357,10 +336,6 @@ class LETTER(T5ForConditionalGeneration):
             + self.fine_loss_weight * fine_loss
             + self.coarse_align_weight * coarse_align_loss
         )
-
-        if self.training:
-            with torch.no_grad():
-                self._train_step += 1
 
         if not return_dict:
             return (loss, fine_logits)

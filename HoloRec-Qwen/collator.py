@@ -36,32 +36,30 @@ def _token_to_id(tokenizer, token):
 
 class Collator(object):
     """
-    Fast HoloRec-Qwen training collator.
+    Collator for implicit interleaved latent HoloRec-Qwen training.
 
-    Sequence format:
+    Important:
+    - coarse tokens are NOT placed into visible input_ids.
+    - fine tokens are NOT concatenated into input_ids either.
+    - input_ids contains only the prompt.
+    - fine_labels / coarse_labels are passed separately to InterleavedLatentQwen.
 
-        prompt + coarse_1 + fine_1 + coarse_2 + fine_2 + ...
+    The model wrapper performs the hidden training loop:
 
-    labels:
-        prompt positions: -100
-        target positions: real token ids
+        prompt -> coarse_logits_1
+        coarse_logits_1 -> soft coarse embedding_1
+        prompt + soft_coarse_1 -> fine_logits_1
+        prompt + soft_coarse_1 + gold_fine_1 -> coarse_logits_2
+        ...
 
-    loss_weights:
-        coarse positions: coarse_loss_weight
-        fine positions: fine_loss_weight
-
-    align_positions / align_coarse_labels:
-        only active on fine-token target positions.
-        They are used by coarse_align_weight in lora_finetune.py.
+    Therefore training and test_ddp.py latent inference stay consistent:
+    coarse is latent, fine is the only decoded recommendation code.
     """
 
     def __init__(self, args, tokenizer):
         self.args = args
         self.tokenizer = tokenizer
         self.max_length = int(getattr(args, "model_max_length", tokenizer.model_max_length))
-        self.add_eos_token = bool(getattr(args, "add_eos_token", True))
-        self.coarse_loss_weight = float(getattr(args, "coarse_loss_weight", 1.0))
-        self.fine_loss_weight = float(getattr(args, "fine_loss_weight", 1.0))
         self._token_id_cache = {}
 
         if self.tokenizer.pad_token_id is None:
@@ -71,176 +69,95 @@ class Collator(object):
             else:
                 self.tokenizer.pad_token_id = 0
 
-        self.tokenizer.padding_side = "right"
+        # Left padding is safer for cached latent decoding/training:
+        # the last column is always the last real prompt token.
+        self.tokenizer.padding_side = "left"
 
     def _token_id(self, token):
         if token not in self._token_id_cache:
             self._token_id_cache[token] = _token_to_id(self.tokenizer, token)
         return self._token_id_cache[token]
 
-    def _encode_prompt(self, text):
-        encoded = self.tokenizer(
-            text,
-            add_special_tokens=True,
-            truncation=False,
-            return_attention_mask=False,
-        )
-        return _flatten_tokenizer_ids(encoded)
-
-    def _build_target(self, fine_tokens, coarse_tokens):
-        target_ids = []
-        target_weights = []
-        align_positions = []
-        align_coarse_labels = []
-
-        if coarse_tokens is None:
-            for fine_tok in fine_tokens:
-                target_ids.append(self._token_id(fine_tok))
-                target_weights.append(self.fine_loss_weight)
-                align_positions.append(IGNORE_INDEX)
-                align_coarse_labels.append(IGNORE_INDEX)
-        else:
-            if len(fine_tokens) != len(coarse_tokens):
-                raise ValueError(
-                    f"fine/coarse length mismatch: {len(fine_tokens)} vs {len(coarse_tokens)}"
-                )
-
-            for pos, (coarse_tok, fine_tok) in enumerate(zip(coarse_tokens, fine_tokens)):
-                coarse_id = self._token_id(coarse_tok)
-                fine_id = self._token_id(fine_tok)
-
-                # Explicit coarse token target.
-                target_ids.append(coarse_id)
-                target_weights.append(self.coarse_loss_weight)
-                align_positions.append(IGNORE_INDEX)
-                align_coarse_labels.append(IGNORE_INDEX)
-
-                # Fine token target.
-                # coarse_align_weight is applied here.
-                target_ids.append(fine_id)
-                target_weights.append(self.fine_loss_weight)
-                align_positions.append(pos)
-                align_coarse_labels.append(coarse_id)
-
-        if self.add_eos_token and self.tokenizer.eos_token_id is not None:
-            target_ids.append(int(self.tokenizer.eos_token_id))
-            target_weights.append(self.fine_loss_weight)
-            align_positions.append(IGNORE_INDEX)
-            align_coarse_labels.append(IGNORE_INDEX)
-
-        return target_ids, target_weights, align_positions, align_coarse_labels
-
     def __call__(self, batch):
-        input_ids_list = []
-        labels_list = []
-        weights_list = []
-        align_positions_list = []
-        align_coarse_labels_list = []
+        input_texts = []
+        fine_label_rows = []
+        coarse_label_rows = []
+
+        max_code_len = 0
 
         for example in batch:
-            if "fine_tokens" not in example:
+            if "fine_tokens" not in example or "coarse_tokens" not in example:
                 raise ValueError(
-                    "Fast HoloRec-Qwen training requires `fine_tokens` in each dataset item. "
-                    "Please train with --tasks seqrec."
+                    "Implicit interleaved HoloRec-Qwen training requires "
+                    "`fine_tokens` and `coarse_tokens` in each example. "
+                    "Please train with --tasks seqrec and pass --coarse_index_file."
                 )
 
             fine_tokens = example["fine_tokens"]
-            coarse_tokens = example.get("coarse_tokens", None)
+            coarse_tokens = example["coarse_tokens"]
 
-            prompt_ids = self._encode_prompt(example["input_ids"])
-            (
-                target_ids,
-                target_weights,
-                target_align_positions,
-                target_align_coarse_labels,
-            ) = self._build_target(
-                fine_tokens=fine_tokens,
-                coarse_tokens=coarse_tokens,
-            )
-
-            if len(target_ids) >= self.max_length:
+            if len(fine_tokens) != len(coarse_tokens):
                 raise ValueError(
-                    f"Target code length {len(target_ids)} >= model_max_length {self.max_length}. "
-                    "Increase --model_max_length or shorten the item code."
+                    f"fine/coarse length mismatch: "
+                    f"{len(fine_tokens)} vs {len(coarse_tokens)}"
                 )
 
-            max_prompt_len = self.max_length - len(target_ids)
-            if len(prompt_ids) > max_prompt_len:
-                prompt_ids = prompt_ids[-max_prompt_len:]
+            input_texts.append(example["input_ids"])
+            fine_ids = [self._token_id(tok) for tok in fine_tokens]
+            coarse_ids = [self._token_id(tok) for tok in coarse_tokens]
 
-            ids = prompt_ids + target_ids
-            labels = [IGNORE_INDEX] * len(prompt_ids) + target_ids
-            loss_weights = [0.0] * len(prompt_ids) + target_weights
-            align_positions = [IGNORE_INDEX] * len(prompt_ids) + target_align_positions
-            align_coarse_labels = [IGNORE_INDEX] * len(prompt_ids) + target_align_coarse_labels
+            fine_label_rows.append(fine_ids)
+            coarse_label_rows.append(coarse_ids)
+            max_code_len = max(max_code_len, len(fine_ids))
 
-            input_ids_list.append(ids)
-            labels_list.append(labels)
-            weights_list.append(loss_weights)
-            align_positions_list.append(align_positions)
-            align_coarse_labels_list.append(align_coarse_labels)
-
-        batch_max_len = max(len(x) for x in input_ids_list)
-        pad_id = int(self.tokenizer.pad_token_id)
-
-        input_ids = torch.full(
-            (len(batch), batch_max_len),
-            fill_value=pad_id,
-            dtype=torch.long,
+        inputs = self.tokenizer(
+            input_texts,
+            return_tensors="pt",
+            padding="longest",
+            truncation=True,
+            max_length=self.max_length,
+            return_attention_mask=True,
+            add_special_tokens=True,
         )
-        attention_mask = torch.zeros(
-            (len(batch), batch_max_len),
-            dtype=torch.long,
-        )
-        labels = torch.full(
-            (len(batch), batch_max_len),
+
+        batch_size = len(batch)
+
+        fine_labels = torch.full(
+            (batch_size, max_code_len),
             fill_value=IGNORE_INDEX,
             dtype=torch.long,
         )
-        loss_weights = torch.zeros(
-            (len(batch), batch_max_len),
-            dtype=torch.float,
-        )
-        align_positions = torch.full(
-            (len(batch), batch_max_len),
-            fill_value=IGNORE_INDEX,
-            dtype=torch.long,
-        )
-        align_coarse_labels = torch.full(
-            (len(batch), batch_max_len),
+        coarse_labels = torch.full(
+            (batch_size, max_code_len),
             fill_value=IGNORE_INDEX,
             dtype=torch.long,
         )
 
-        for i in range(len(batch)):
-            length = len(input_ids_list[i])
+        for i in range(batch_size):
+            fine_len = len(fine_label_rows[i])
+            coarse_len = len(coarse_label_rows[i])
 
-            input_ids[i, :length] = torch.tensor(input_ids_list[i], dtype=torch.long)
-            attention_mask[i, :length] = 1
-            labels[i, :length] = torch.tensor(labels_list[i], dtype=torch.long)
-            loss_weights[i, :length] = torch.tensor(weights_list[i], dtype=torch.float)
-            align_positions[i, :length] = torch.tensor(
-                align_positions_list[i],
+            fine_labels[i, :fine_len] = torch.tensor(
+                fine_label_rows[i],
                 dtype=torch.long,
             )
-            align_coarse_labels[i, :length] = torch.tensor(
-                align_coarse_labels_list[i],
+            coarse_labels[i, :coarse_len] = torch.tensor(
+                coarse_label_rows[i],
                 dtype=torch.long,
             )
 
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels,
-            "loss_weights": loss_weights,
-            "align_positions": align_positions,
-            "align_coarse_labels": align_coarse_labels,
-        }
+        inputs["fine_labels"] = fine_labels
+        inputs["coarse_labels"] = coarse_labels
+
+        return inputs
 
 
 class TestCollator(object):
     """
     Test collator remains prompt-only.
+
+    test_ddp.py performs latent interleaved inference internally and decodes
+    only fine tokens.
     """
 
     def __init__(self, args, tokenizer):
@@ -268,6 +185,7 @@ class TestCollator(object):
             max_length=self.tokenizer.model_max_length,
             truncation=True,
             return_attention_mask=True,
+            add_special_tokens=True,
         )
 
         return inputs, targets, coarse_targets

@@ -1,11 +1,17 @@
 import argparse
+import inspect
 import os
 import sys
-import inspect
 
 import torch
+import torch.nn.functional as F
 import transformers
-from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from transformers import (
+    AutoConfig,
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    BitsAndBytesConfig,
+)
 
 from peft import (
     TaskType,
@@ -17,98 +23,59 @@ from peft import (
 
 from utils import *
 from collator import Collator
-from modeling_qwen_latent import InterleavedLatentQwen
 
 
-def token_to_id(tokenizer, token):
-    token_id = tokenizer.convert_tokens_to_ids(token)
-
-    if token_id is None:
-        encoded = tokenizer(token, add_special_tokens=False).get("input_ids", [])
-        if len(encoded) == 1:
-            return int(encoded[0])
-        raise ValueError(f"Token {token!r} is not a single token: {encoded}")
-
-    unk_id = getattr(tokenizer, "unk_token_id", None)
-    if unk_id is not None and token_id == unk_id:
-        encoded = tokenizer(token, add_special_tokens=False).get("input_ids", [])
-        if len(encoded) == 1:
-            return int(encoded[0])
-        raise ValueError(f"Token {token!r} maps to unk or multiple ids: {encoded}")
-
-    return int(token_id)
+IGNORE_INDEX = -100
 
 
-def build_coarse_position_token_ids_from_dataset(dataset, tokenizer):
+class HoloRecFastTrainer(transformers.Trainer):
     """
-    dataset should be SeqRecDataset.
+    Trainer with position-wise coarse/fine loss weights.
+
+    The model itself is a normal AutoModelForCausalLM / PEFT model.
+    We keep the forward pass single-shot and only customize CE reduction.
     """
-    if not hasattr(dataset, "coarse_indices") or dataset.coarse_indices is None:
-        raise ValueError(
-            "Dataset has no coarse_indices. "
-            "Please pass --coarse_index_file, for example --coarse_index_file .tw8.json"
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        labels = inputs.pop("labels")
+        loss_weights = inputs.pop("loss_weights", None)
+
+        outputs = model(**inputs, return_dict=True)
+        logits = outputs.logits
+
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous().to(shift_logits.device)
+
+        vocab_size = shift_logits.size(-1)
+        flat_loss = F.cross_entropy(
+            shift_logits.view(-1, vocab_size),
+            shift_labels.view(-1),
+            ignore_index=IGNORE_INDEX,
+            reduction="none",
         )
+        token_loss = flat_loss.view_as(shift_labels)
 
-    pos_to_ids = {}
+        valid_mask = shift_labels.ne(IGNORE_INDEX)
 
-    for _, seq in dataset.coarse_indices.items():
-        for pos, tok in enumerate(seq):
-            tid = token_to_id(tokenizer, tok)
-            pos_to_ids.setdefault(pos, set()).add(tid)
+        if loss_weights is None:
+            denom = valid_mask.sum().clamp_min(1)
+            loss = (token_loss * valid_mask).sum() / denom
+        else:
+            shift_weights = loss_weights[..., 1:].contiguous().to(
+                device=shift_logits.device,
+                dtype=token_loss.dtype,
+            )
+            weighted_mask = shift_weights * valid_mask.to(token_loss.dtype)
+            denom = weighted_mask.sum().clamp_min(1.0)
+            loss = (token_loss * weighted_mask).sum() / denom
 
-    if len(pos_to_ids) == 0:
-        raise ValueError("coarse position token ids are empty.")
-
-    max_pos = max(pos_to_ids.keys())
-
-    return [
-        sorted(list(pos_to_ids.get(i, set())))
-        for i in range(max_pos + 1)
-    ]
-
-
-def prepare_kbit_model_without_gradient_checkpointing(model):
-    """
-    Original HoloRec-Qwen uses prepare_model_for_kbit_training(model).
-
-    For this latent wrapper, we must avoid gradient checkpointing because
-    the wrapper calls the same inner model multiple times in a single forward.
-    DeepSpeed ZeRO-1/2 + gradient checkpointing can trigger:
-
-        "parameter has already been reduced"
-
-    This helper keeps k-bit preparation but disables gradient checkpointing.
-    """
-    try:
-        model = prepare_model_for_kbit_training(
-            model,
-            use_gradient_checkpointing=False,
-        )
-    except TypeError:
-        model = prepare_model_for_kbit_training(model)
-
-    if hasattr(model, "gradient_checkpointing_disable"):
-        try:
-            model.gradient_checkpointing_disable()
-        except Exception:
-            pass
-
-    if hasattr(model, "config") and hasattr(model.config, "use_cache"):
-        model.config.use_cache = False
-
-    return model
+        return (loss, outputs) if return_outputs else loss
 
 
 def build_training_args(args, ddp: bool):
-    """
-    Compatible with different transformers versions:
-    - some versions use evaluation_strategy
-    - some versions use eval_strategy
-
-    Important changes for latent coarse-to-fine training:
-    - gradient_checkpointing=False
-    - remove_unused_columns=False
-    """
+    report_to = []
+    if args.report_to and args.report_to.lower() != "none":
+        report_to = [x.strip() for x in args.report_to.split(",") if x.strip()]
 
     ta_kwargs = dict(
         seed=args.seed,
@@ -120,29 +87,21 @@ def build_training_args(args, ddp: bool):
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         lr_scheduler_type=args.lr_scheduler_type,
-        report_to=["wandb"],
+        report_to=report_to,
         fp16=args.fp16,
         bf16=args.bf16,
         logging_steps=args.logging_step,
         optim=args.optim,
-
-        # Critical:
-        # This wrapper calls the inner Qwen/PEFT model multiple times in one forward.
-        # DeepSpeed ZeRO-1/2 + gradient checkpointing may reduce the same parameter twice.
-        gradient_checkpointing=False,
-
+        gradient_checkpointing=args.gradient_checkpointing,
         save_strategy=args.save_and_eval_strategy,
         eval_steps=args.save_and_eval_steps,
         save_steps=args.save_and_eval_steps,
         output_dir=args.output_dir,
-        save_total_limit=8,
+        save_total_limit=args.save_total_limit,
         load_best_model_at_end=True,
         deepspeed=args.deepspeed,
         ddp_find_unused_parameters=False if ddp else None,
         eval_delay=1 if args.save_and_eval_strategy == "epoch" else 2000,
-
-        # Critical:
-        # Trainer must not drop fine_labels / coarse_labels.
         remove_unused_columns=False,
     )
 
@@ -153,14 +112,59 @@ def build_training_args(args, ddp: bool):
     else:
         ta_kwargs["eval_strategy"] = args.save_and_eval_strategy
 
+    if "gradient_checkpointing_kwargs" in sig and args.gradient_checkpointing:
+        ta_kwargs["gradient_checkpointing_kwargs"] = {"use_reentrant": False}
+
     return transformers.TrainingArguments(**ta_kwargs)
+
+
+def make_quant_config(args, compute_dtype):
+    if args.load_in_4bit:
+        return BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=compute_dtype,
+        )
+
+    if args.load_in_8bit:
+        return BitsAndBytesConfig(
+            load_in_8bit=True,
+            llm_int8_threshold=6.0,
+            llm_int8_has_fp16_weight=False,
+        )
+
+    return None
+
+
+def prepare_model_for_training(model, args):
+    if args.load_in_4bit or args.load_in_8bit:
+        try:
+            model = prepare_model_for_kbit_training(
+                model,
+                use_gradient_checkpointing=args.gradient_checkpointing,
+            )
+        except TypeError:
+            model = prepare_model_for_kbit_training(model)
+
+    if hasattr(model.config, "use_cache"):
+        model.config.use_cache = False
+
+    if args.gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
+        try:
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+        except TypeError:
+            model.gradient_checkpointing_enable()
+
+    return model
 
 
 def train(args):
     set_seed(args.seed)
     ensure_dir(args.output_dir)
 
-    device_map = "auto"
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     ddp = world_size != 1
     local_rank = int(os.environ.get("LOCAL_RANK") or 0)
@@ -168,10 +172,14 @@ def train(args):
     if local_rank == 0:
         print(vars(args))
 
-    if ddp:
-        device_map = {"": local_rank}
+    device_map = {"": local_rank} if ddp else "auto"
 
-    # ===== 1) config / tokenizer =====
+    compute_dtype = torch.float32
+    if args.bf16:
+        compute_dtype = torch.bfloat16
+    elif args.fp16:
+        compute_dtype = torch.float16
+
     config = AutoConfig.from_pretrained(
         args.base_model,
         trust_remote_code=True,
@@ -187,19 +195,15 @@ def train(args):
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-
     tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
 
-    # ===== 2) dataset =====
     train_data, valid_data = load_datasets(args)
 
-    # This code assumes --tasks seqrec, so train_data.datasets[0] is SeqRecDataset.
     if not hasattr(train_data, "datasets") or len(train_data.datasets) == 0:
         raise ValueError("train_data should be a ConcatDataset with at least one dataset.")
 
     first_train_dataset = train_data.datasets[0]
 
-    # Add both fine + coarse tokens.
     add_num = tokenizer.add_tokens(first_train_dataset.get_new_tokens())
     config.vocab_size = len(tokenizer)
 
@@ -208,29 +212,33 @@ def train(args):
         print("train data num:", len(train_data))
         print("valid data num:", len(valid_data))
         print("vocab size:", len(tokenizer))
+        print("fast mode: one forward for prompt + interleaved coarse/fine labels")
+        print("coarse_loss_weight:", args.coarse_loss_weight)
+        print("fine_loss_weight:", args.fine_loss_weight)
+        print("coarse_align_weight is accepted for compatibility but ignored in fast mode.")
 
     tokenizer.save_pretrained(args.output_dir)
     config.save_pretrained(args.output_dir)
 
     collator = Collator(args, tokenizer)
 
-    # ===== 3) quantization config, same as original script =====
-    quant_config = BitsAndBytesConfig(
-        load_in_8bit=True,
-        llm_int8_threshold=6.0,
-        llm_int8_has_fp16_weight=False,
+    quant_config = make_quant_config(args, compute_dtype)
+
+    model_kwargs = dict(
+        device_map=device_map,
+        torch_dtype=compute_dtype if (args.fp16 or args.bf16) else None,
+        trust_remote_code=True,
     )
 
-    # ===== 4) load base model =====
-    dtype = torch.float16 if args.fp16 else (torch.bfloat16 if args.bf16 else None)
+    if quant_config is not None:
+        model_kwargs["quantization_config"] = quant_config
+
+    if args.attn_implementation:
+        model_kwargs["attn_implementation"] = args.attn_implementation
 
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
-        device_map=device_map,
-        quantization_config=quant_config,
-        torch_dtype=dtype,
-        trust_remote_code=True,
-        attn_implementation="flash_attention_2",
+        **model_kwargs,
     )
 
     model.resize_token_embeddings(len(tokenizer))
@@ -238,24 +246,18 @@ def train(args):
     if hasattr(model.config, "use_cache"):
         model.config.use_cache = False
 
-    # ===== 5) k-bit training preparation =====
-    # Important: no gradient checkpointing here.
-    model = prepare_kbit_model_without_gradient_checkpointing(model)
+    model = prepare_model_for_training(model, args)
 
-    if hasattr(model.config, "use_cache"):
-        model.config.use_cache = False
-
-    # ===== 6) LoRA config =====
     lora_targets = (
-        args.lora_target_modules.split(",")
+        [x.strip() for x in args.lora_target_modules.split(",") if x.strip()]
         if args.lora_target_modules
-        else ["qkv_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+        else ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
     )
 
     modules_to_save = (
-        args.lora_modules_to_save.split(",")
+        [x.strip() for x in args.lora_modules_to_save.split(",") if x.strip()]
         if args.lora_modules_to_save
-        else []
+        else ["embed_tokens", "lm_head"]
     )
 
     lora_config = LoraConfig(
@@ -269,12 +271,11 @@ def train(args):
         task_type=TaskType.CAUSAL_LM,
     )
 
-    peft_model = get_peft_model(model, lora_config)
+    model = get_peft_model(model, lora_config)
 
-    if hasattr(peft_model.config, "use_cache"):
-        peft_model.config.use_cache = False
+    if hasattr(model.config, "use_cache"):
+        model.config.use_cache = False
 
-    # ===== 7) resume LoRA adapter =====
     if args.resume_from_checkpoint:
         checkpoint_name = os.path.join(args.resume_from_checkpoint, "adapter_model.bin")
         args.resume_from_checkpoint = False
@@ -282,55 +283,22 @@ def train(args):
         if os.path.exists(checkpoint_name):
             if local_rank == 0:
                 print(f"Restarting from {checkpoint_name}")
-
             adapters_weights = torch.load(checkpoint_name, map_location="cpu")
-            set_peft_model_state_dict(peft_model, adapters_weights)
+            set_peft_model_state_dict(model, adapters_weights)
         else:
             if local_rank == 0:
                 print(f"Checkpoint {checkpoint_name} not found")
 
     if local_rank == 0:
-        peft_model.print_trainable_parameters()
+        model.print_trainable_parameters()
 
     if not ddp and torch.cuda.device_count() > 1:
-        peft_model.is_parallelizable = True
-        peft_model.model_parallel = True
+        model.is_parallelizable = True
+        model.model_parallel = True
 
-    # ===== 8) build coarse codebook ids =====
-    coarse_position_token_ids = build_coarse_position_token_ids_from_dataset(
-        first_train_dataset,
-        tokenizer,
-    )
-
-    if local_rank == 0:
-        print("coarse positions:", len(coarse_position_token_ids))
-        print("coarse_loss_weight:", args.coarse_loss_weight)
-        print("fine_loss_weight:", args.fine_loss_weight)
-        print("coarse_align_weight:", args.coarse_align_weight)
-        print("temperature:", args.temperature)
-
-    # ===== 9) wrap PEFT model with latent coarse-to-fine training module =====
-    model = InterleavedLatentQwen(
-        base_model=peft_model,
-        pad_token_id=tokenizer.pad_token_id,
-        temperature=args.temperature,
-        coarse_loss_weight=args.coarse_loss_weight,
-        fine_loss_weight=args.fine_loss_weight,
-        coarse_align_weight=args.coarse_align_weight,
-    )
-
-    model.set_codebooks(coarse_position_token_ids)
-
-    if hasattr(model.config, "use_cache"):
-        model.config.use_cache = False
-
-    # Do not enable gradient checkpointing on this wrapper.
-    model.gradient_checkpointing_disable()
-
-    # ===== 10) Trainer =====
     training_args = build_training_args(args, ddp)
 
-    trainer = transformers.Trainer(
+    trainer = HoloRecFastTrainer(
         model=model,
         train_dataset=train_data,
         eval_dataset=valid_data,
@@ -339,17 +307,7 @@ def train(args):
         data_collator=collator,
     )
 
-    # Keep original behavior. This line is harmless because Trainer already holds model.
-    # If torch.compile causes issues in your environment, comment it out.
-    if torch.__version__ >= "2" and sys.platform != "win32":
-        try:
-            model = torch.compile(model)
-        except Exception as e:
-            if local_rank == 0:
-                print("torch.compile skipped because:", repr(e))
-
     trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
-
     trainer.save_state()
     trainer.save_model(output_dir=args.output_dir)
 
@@ -358,26 +316,51 @@ def train(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="LLMRec")
+    parser = argparse.ArgumentParser(description="Fast HoloRec-Qwen QLoRA")
 
     parser = parse_global_args(parser)
     parser = parse_train_args(parser)
     parser = parse_dataset_args(parser)
 
-    # Coarse codebook. For your current setting, pass --coarse_index_file .tw8.json.
     parser.add_argument("--coarse_index_file", type=str, default=".tw8.json")
 
-    # Latent coarse-to-fine loss weights.
     parser.add_argument("--coarse_loss_weight", type=float, default=1.0)
     parser.add_argument("--fine_loss_weight", type=float, default=1.0)
-    parser.add_argument("--coarse_align_weight", type=float, default=2.0)
+    parser.add_argument("--coarse_align_weight", type=float, default=0.0)
+
+    parser.add_argument("--add_eos_token", action="store_true", default=True)
+    parser.add_argument("--no_add_eos_token", action="store_false", dest="add_eos_token")
+
+    parser.add_argument("--load_in_4bit", action="store_true", default=True)
+    parser.add_argument("--no_load_in_4bit", action="store_false", dest="load_in_4bit")
+    parser.add_argument("--load_in_8bit", action="store_true", default=False)
+
+    parser.add_argument("--gradient_checkpointing", action="store_true", default=True)
+    parser.add_argument(
+        "--no_gradient_checkpointing",
+        action="store_false",
+        dest="gradient_checkpointing",
+    )
+
+    parser.add_argument(
+        "--attn_implementation",
+        type=str,
+        default="flash_attention_2",
+        help="Use flash_attention_2 if installed; set empty string to disable.",
+    )
+
+    parser.add_argument("--report_to", type=str, default="wandb")
+    parser.add_argument("--save_total_limit", type=int, default=8)
 
     args = parser.parse_args()
 
+    if args.load_in_4bit and args.load_in_8bit:
+        raise ValueError("Choose only one of --load_in_4bit and --load_in_8bit.")
+
     if args.tasks.lower() != "seqrec":
         raise ValueError(
-            "Latent coarse-to-fine training currently supports only --tasks seqrec. "
-            "Please run with: --tasks seqrec --train_prompt_sample_num 1 --train_data_sample_num 0"
+            "Fast HoloRec-Qwen currently supports only --tasks seqrec. "
+            "Use: --tasks seqrec --train_prompt_sample_num 1 --train_data_sample_num 0"
         )
 
     train(args)

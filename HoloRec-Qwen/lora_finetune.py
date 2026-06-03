@@ -2,6 +2,7 @@ import argparse
 import inspect
 import os
 import sys
+from typing import Dict, List
 
 import torch
 import torch.nn.functional as F
@@ -28,46 +29,268 @@ from collator import Collator
 IGNORE_INDEX = -100
 
 
-class HoloRecFastTrainer(transformers.Trainer):
+def _flatten_tokenizer_ids(encoded):
+    ids = encoded.get("input_ids", encoded)
+    if isinstance(ids, torch.Tensor):
+        ids = ids.tolist()
+    if len(ids) > 0 and isinstance(ids[0], list):
+        ids = ids[0]
+    return [int(x) for x in ids]
+
+
+def token_to_id(tokenizer, token):
+    token_id = tokenizer.convert_tokens_to_ids(token)
+
+    if token_id is None:
+        encoded = tokenizer(token, add_special_tokens=False)
+        ids = _flatten_tokenizer_ids(encoded)
+        if len(ids) == 1:
+            return int(ids[0])
+        raise ValueError(f"Token {token!r} is not a single token: {ids}")
+
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+    if unk_id is not None and int(token_id) == int(unk_id):
+        encoded = tokenizer(token, add_special_tokens=False)
+        ids = _flatten_tokenizer_ids(encoded)
+        if len(ids) == 1:
+            return int(ids[0])
+        raise ValueError(f"Token {token!r} maps to unk or multiple ids: {ids}")
+
+    return int(token_id)
+
+
+def build_align_codebooks_from_dataset(dataset, tokenizer) -> List[Dict[str, List[int]]]:
     """
-    Trainer with position-wise coarse/fine loss weights.
+    Build position-wise fine-token -> coarse-bucket codebooks.
 
-    The model itself is a normal AutoModelForCausalLM / PEFT model.
-    We keep the forward pass single-shot and only customize CE reduction.
+    For each code position p:
+        fine_ids[p]   = all fine token ids appearing at p
+        coarse_ids[p] = corresponding coarse token id for each fine token candidate
+
+    coarse_align_weight uses these codebooks to compute:
+
+        -log P(fine token is inside gold coarse bucket | fine-position logits)
+
+    This preserves a coarse-level alignment objective without another Qwen forward.
     """
 
-    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        labels = inputs.pop("labels")
-        loss_weights = inputs.pop("loss_weights", None)
+    if not hasattr(dataset, "indices"):
+        raise ValueError("Dataset has no `indices`; cannot build align codebooks.")
 
-        outputs = model(**inputs, return_dict=True)
-        logits = outputs.logits
+    if not hasattr(dataset, "coarse_indices") or dataset.coarse_indices is None:
+        raise ValueError(
+            "coarse_align_weight requires coarse_indices. "
+            "Please pass --coarse_index_file, for example --coarse_index_file .tw8.json"
+        )
 
+    pos_to_pairs = {}
+
+    for item_id, fine_seq in dataset.indices.items():
+        item_key = str(item_id)
+
+        if item_key not in dataset.coarse_indices:
+            raise ValueError(f"Item {item_key} exists in fine indices but not coarse_indices.")
+
+        coarse_seq = dataset.coarse_indices[item_key]
+
+        if len(fine_seq) != len(coarse_seq):
+            raise ValueError(
+                f"fine/coarse code length mismatch for item {item_key}: "
+                f"{len(fine_seq)} vs {len(coarse_seq)}"
+            )
+
+        for pos, (fine_tok, coarse_tok) in enumerate(zip(fine_seq, coarse_seq)):
+            fine_id = token_to_id(tokenizer, fine_tok)
+            coarse_id = token_to_id(tokenizer, coarse_tok)
+            pos_to_pairs.setdefault(pos, set()).add((fine_id, coarse_id))
+
+    if len(pos_to_pairs) == 0:
+        raise ValueError("align codebooks are empty.")
+
+    max_pos = max(pos_to_pairs.keys())
+    codebooks = []
+
+    for pos in range(max_pos + 1):
+        pairs = sorted(list(pos_to_pairs.get(pos, set())))
+
+        if len(pairs) == 0:
+            codebooks.append({"fine_ids": [], "coarse_ids": []})
+            continue
+
+        fine_ids = [int(x[0]) for x in pairs]
+        coarse_ids = [int(x[1]) for x in pairs]
+
+        codebooks.append(
+            {
+                "fine_ids": fine_ids,
+                "coarse_ids": coarse_ids,
+            }
+        )
+
+    return codebooks
+
+
+class HoloRecFastAlignTrainer(transformers.Trainer):
+    """
+    Single-forward HoloRec-Qwen trainer.
+
+    Loss parts:
+      1. weighted token CE for explicit interleaved coarse/fine tokens
+      2. optional coarse bucket alignment loss on fine-token prediction positions
+
+    This keeps coarse_align_weight meaningful without using InterleavedLatentQwen.
+    """
+
+    def __init__(self, *args, align_codebooks=None, coarse_align_weight=0.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.align_codebooks = align_codebooks or []
+        self.coarse_align_weight = float(coarse_align_weight)
+        self._align_tensor_cache = {}
+
+    def _get_align_codebook_tensors(self, pos: int, device):
+        cache_key = (int(pos), str(device))
+
+        if cache_key in self._align_tensor_cache:
+            return self._align_tensor_cache[cache_key]
+
+        if pos < 0 or pos >= len(self.align_codebooks):
+            return None
+
+        codebook = self.align_codebooks[pos]
+        fine_ids = codebook.get("fine_ids", [])
+        coarse_ids = codebook.get("coarse_ids", [])
+
+        if len(fine_ids) == 0:
+            return None
+
+        out = {
+            "fine_ids": torch.tensor(fine_ids, dtype=torch.long, device=device),
+            "coarse_ids": torch.tensor(coarse_ids, dtype=torch.long, device=device),
+        }
+
+        self._align_tensor_cache[cache_key] = out
+        return out
+
+    def _compute_weighted_token_loss(self, logits, labels, loss_weights):
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous().to(shift_logits.device)
 
         vocab_size = shift_logits.size(-1)
+
         flat_loss = F.cross_entropy(
             shift_logits.view(-1, vocab_size),
             shift_labels.view(-1),
             ignore_index=IGNORE_INDEX,
             reduction="none",
         )
-        token_loss = flat_loss.view_as(shift_labels)
 
+        token_loss = flat_loss.view_as(shift_labels)
         valid_mask = shift_labels.ne(IGNORE_INDEX)
 
         if loss_weights is None:
             denom = valid_mask.sum().clamp_min(1)
-            loss = (token_loss * valid_mask).sum() / denom
-        else:
-            shift_weights = loss_weights[..., 1:].contiguous().to(
-                device=shift_logits.device,
-                dtype=token_loss.dtype,
-            )
-            weighted_mask = shift_weights * valid_mask.to(token_loss.dtype)
-            denom = weighted_mask.sum().clamp_min(1.0)
-            loss = (token_loss * weighted_mask).sum() / denom
+            return (token_loss * valid_mask).sum() / denom
+
+        shift_weights = loss_weights[..., 1:].contiguous().to(
+            device=shift_logits.device,
+            dtype=token_loss.dtype,
+        )
+
+        weighted_mask = shift_weights * valid_mask.to(token_loss.dtype)
+        denom = weighted_mask.sum().clamp_min(1.0)
+
+        return (token_loss * weighted_mask).sum() / denom
+
+    def _compute_coarse_align_loss(self, logits, align_positions, align_coarse_labels):
+        if self.coarse_align_weight <= 0:
+            return logits.new_zeros(())
+
+        if align_positions is None or align_coarse_labels is None:
+            return logits.new_zeros(())
+
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_align_positions = align_positions[..., 1:].contiguous().to(shift_logits.device)
+        shift_align_coarse = align_coarse_labels[..., 1:].contiguous().to(shift_logits.device)
+
+        active_mask = (
+            shift_align_positions.ne(IGNORE_INDEX)
+            & shift_align_coarse.ne(IGNORE_INDEX)
+        )
+
+        if not active_mask.any():
+            return logits.new_zeros(())
+
+        flat_logits = shift_logits.view(-1, shift_logits.size(-1))
+        flat_positions = shift_align_positions.view(-1)
+        flat_coarse = shift_align_coarse.view(-1)
+        flat_active = active_mask.view(-1)
+
+        unique_positions = torch.unique(flat_positions[flat_active]).detach().cpu().tolist()
+
+        losses = []
+
+        for pos in unique_positions:
+            pos = int(pos)
+            codebook = self._get_align_codebook_tensors(pos, shift_logits.device)
+
+            if codebook is None:
+                continue
+
+            candidate_fine_ids = codebook["fine_ids"]
+            candidate_coarse_ids = codebook["coarse_ids"]
+
+            row_mask = flat_active & flat_positions.eq(pos)
+            row_indices = torch.nonzero(row_mask, as_tuple=False).view(-1)
+
+            if row_indices.numel() == 0:
+                continue
+
+            row_logits = flat_logits.index_select(0, row_indices)
+            candidate_logits = row_logits.index_select(1, candidate_fine_ids).float()
+
+            # Denominator: all possible fine tokens at this code position.
+            denom = torch.logsumexp(candidate_logits, dim=-1)
+
+            target_coarse = flat_coarse.index_select(0, row_indices)
+            group_mask = candidate_coarse_ids.unsqueeze(0).eq(target_coarse.unsqueeze(1))
+
+            neg_inf = torch.finfo(candidate_logits.dtype).min
+            group_logits = candidate_logits.masked_fill(~group_mask, neg_inf)
+
+            # Numerator: fine-token candidates belonging to the gold coarse bucket.
+            numer = torch.logsumexp(group_logits, dim=-1)
+
+            valid = torch.isfinite(numer)
+            if valid.any():
+                losses.append(-(numer[valid] - denom[valid]))
+
+        if len(losses) == 0:
+            return logits.new_zeros(())
+
+        return torch.cat(losses, dim=0).mean().to(dtype=logits.dtype)
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        labels = inputs.pop("labels")
+        loss_weights = inputs.pop("loss_weights", None)
+        align_positions = inputs.pop("align_positions", None)
+        align_coarse_labels = inputs.pop("align_coarse_labels", None)
+
+        outputs = model(**inputs, return_dict=True)
+        logits = outputs.logits
+
+        token_loss = self._compute_weighted_token_loss(
+            logits=logits,
+            labels=labels,
+            loss_weights=loss_weights,
+        )
+
+        align_loss = self._compute_coarse_align_loss(
+            logits=logits,
+            align_positions=align_positions,
+            align_coarse_labels=align_coarse_labels,
+        )
+
+        loss = token_loss + self.coarse_align_weight * align_loss
 
         return (loss, outputs) if return_outputs else loss
 
@@ -195,6 +418,7 @@ def train(args):
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+
     tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
 
     train_data, valid_data = load_datasets(args)
@@ -212,23 +436,33 @@ def train(args):
         print("train data num:", len(train_data))
         print("valid data num:", len(valid_data))
         print("vocab size:", len(tokenizer))
-        print("fast mode: one forward for prompt + interleaved coarse/fine labels")
-        print("coarse_loss_weight:", args.coarse_loss_weight)
-        print("fine_loss_weight:", args.fine_loss_weight)
-        print("coarse_align_weight is accepted for compatibility but ignored in fast mode.")
 
     tokenizer.save_pretrained(args.output_dir)
     config.save_pretrained(args.output_dir)
 
     collator = Collator(args, tokenizer)
 
+    align_codebooks = build_align_codebooks_from_dataset(
+        dataset=first_train_dataset,
+        tokenizer=tokenizer,
+    )
+
+    if local_rank == 0:
+        print("fast mode: one forward for prompt + interleaved coarse/fine labels")
+        print("coarse positions:", len(align_codebooks))
+        print("coarse_loss_weight:", args.coarse_loss_weight)
+        print("fine_loss_weight:", args.fine_loss_weight)
+        print("coarse_align_weight:", args.coarse_align_weight)
+
     quant_config = make_quant_config(args, compute_dtype)
 
     model_kwargs = dict(
         device_map=device_map,
-        torch_dtype=compute_dtype if (args.fp16 or args.bf16) else None,
         trust_remote_code=True,
     )
+
+    if args.fp16 or args.bf16:
+        model_kwargs["torch_dtype"] = compute_dtype
 
     if quant_config is not None:
         model_kwargs["quantization_config"] = quant_config
@@ -251,7 +485,16 @@ def train(args):
     lora_targets = (
         [x.strip() for x in args.lora_target_modules.split(",") if x.strip()]
         if args.lora_target_modules
-        else ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+        else [
+            "qkv_proj",
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ]
     )
 
     modules_to_save = (
@@ -298,13 +541,15 @@ def train(args):
 
     training_args = build_training_args(args, ddp)
 
-    trainer = HoloRecFastTrainer(
+    trainer = HoloRecFastAlignTrainer(
         model=model,
         train_dataset=train_data,
         eval_dataset=valid_data,
         args=training_args,
         tokenizer=tokenizer,
         data_collator=collator,
+        align_codebooks=align_codebooks,
+        coarse_align_weight=args.coarse_align_weight,
     )
 
     trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
@@ -316,7 +561,7 @@ def train(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Fast HoloRec-Qwen QLoRA")
+    parser = argparse.ArgumentParser(description="Fast HoloRec-Qwen QLoRA with coarse alignment")
 
     parser = parse_global_args(parser)
     parser = parse_train_args(parser)
@@ -326,7 +571,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--coarse_loss_weight", type=float, default=1.0)
     parser.add_argument("--fine_loss_weight", type=float, default=1.0)
-    parser.add_argument("--coarse_align_weight", type=float, default=0.0)
+    parser.add_argument("--coarse_align_weight", type=float, default=2.0)
 
     parser.add_argument("--add_eos_token", action="store_true", default=True)
     parser.add_argument("--no_add_eos_token", action="store_false", dest="add_eos_token")

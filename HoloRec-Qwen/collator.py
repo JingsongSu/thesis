@@ -38,13 +38,21 @@ class Collator(object):
     """
     Fast HoloRec-Qwen training collator.
 
-    It converts each example into one standard CausalLM sequence:
+    Sequence format:
 
         prompt + coarse_1 + fine_1 + coarse_2 + fine_2 + ...
 
-    Labels are masked on the prompt and active only on the target part.
-    This makes training a single forward pass, instead of calling Qwen once
-    for each coarse/fine step.
+    labels:
+        prompt positions: -100
+        target positions: real token ids
+
+    loss_weights:
+        coarse positions: coarse_loss_weight
+        fine positions: fine_loss_weight
+
+    align_positions / align_coarse_labels:
+        only active on fine-token target positions.
+        They are used by coarse_align_weight in lora_finetune.py.
     """
 
     def __init__(self, args, tokenizer):
@@ -79,34 +87,55 @@ class Collator(object):
         )
         return _flatten_tokenizer_ids(encoded)
 
-    def _build_target_ids_and_weights(self, fine_tokens, coarse_tokens):
+    def _build_target(self, fine_tokens, coarse_tokens):
+        target_ids = []
+        target_weights = []
+        align_positions = []
+        align_coarse_labels = []
+
         if coarse_tokens is None:
-            target_ids = [self._token_id(tok) for tok in fine_tokens]
-            weights = [self.fine_loss_weight for _ in target_ids]
+            for fine_tok in fine_tokens:
+                target_ids.append(self._token_id(fine_tok))
+                target_weights.append(self.fine_loss_weight)
+                align_positions.append(IGNORE_INDEX)
+                align_coarse_labels.append(IGNORE_INDEX)
         else:
             if len(fine_tokens) != len(coarse_tokens):
                 raise ValueError(
                     f"fine/coarse length mismatch: {len(fine_tokens)} vs {len(coarse_tokens)}"
                 )
 
-            target_ids = []
-            weights = []
-            for coarse_tok, fine_tok in zip(coarse_tokens, fine_tokens):
-                target_ids.append(self._token_id(coarse_tok))
-                weights.append(self.coarse_loss_weight)
-                target_ids.append(self._token_id(fine_tok))
-                weights.append(self.fine_loss_weight)
+            for pos, (coarse_tok, fine_tok) in enumerate(zip(coarse_tokens, fine_tokens)):
+                coarse_id = self._token_id(coarse_tok)
+                fine_id = self._token_id(fine_tok)
+
+                # Explicit coarse token target.
+                target_ids.append(coarse_id)
+                target_weights.append(self.coarse_loss_weight)
+                align_positions.append(IGNORE_INDEX)
+                align_coarse_labels.append(IGNORE_INDEX)
+
+                # Fine token target.
+                # coarse_align_weight is applied here.
+                target_ids.append(fine_id)
+                target_weights.append(self.fine_loss_weight)
+                align_positions.append(pos)
+                align_coarse_labels.append(coarse_id)
 
         if self.add_eos_token and self.tokenizer.eos_token_id is not None:
             target_ids.append(int(self.tokenizer.eos_token_id))
-            weights.append(self.fine_loss_weight)
+            target_weights.append(self.fine_loss_weight)
+            align_positions.append(IGNORE_INDEX)
+            align_coarse_labels.append(IGNORE_INDEX)
 
-        return target_ids, weights
+        return target_ids, target_weights, align_positions, align_coarse_labels
 
     def __call__(self, batch):
         input_ids_list = []
         labels_list = []
         weights_list = []
+        align_positions_list = []
+        align_coarse_labels_list = []
 
         for example in batch:
             if "fine_tokens" not in example:
@@ -119,7 +148,12 @@ class Collator(object):
             coarse_tokens = example.get("coarse_tokens", None)
 
             prompt_ids = self._encode_prompt(example["input_ids"])
-            target_ids, target_weights = self._build_target_ids_and_weights(
+            (
+                target_ids,
+                target_weights,
+                target_align_positions,
+                target_align_coarse_labels,
+            ) = self._build_target(
                 fine_tokens=fine_tokens,
                 coarse_tokens=coarse_tokens,
             )
@@ -137,10 +171,14 @@ class Collator(object):
             ids = prompt_ids + target_ids
             labels = [IGNORE_INDEX] * len(prompt_ids) + target_ids
             loss_weights = [0.0] * len(prompt_ids) + target_weights
+            align_positions = [IGNORE_INDEX] * len(prompt_ids) + target_align_positions
+            align_coarse_labels = [IGNORE_INDEX] * len(prompt_ids) + target_align_coarse_labels
 
             input_ids_list.append(ids)
             labels_list.append(labels)
             weights_list.append(loss_weights)
+            align_positions_list.append(align_positions)
+            align_coarse_labels_list.append(align_coarse_labels)
 
         batch_max_len = max(len(x) for x in input_ids_list)
         pad_id = int(self.tokenizer.pad_token_id)
@@ -163,28 +201,46 @@ class Collator(object):
             (len(batch), batch_max_len),
             dtype=torch.float,
         )
+        align_positions = torch.full(
+            (len(batch), batch_max_len),
+            fill_value=IGNORE_INDEX,
+            dtype=torch.long,
+        )
+        align_coarse_labels = torch.full(
+            (len(batch), batch_max_len),
+            fill_value=IGNORE_INDEX,
+            dtype=torch.long,
+        )
 
-        for i, (ids, labs, weights) in enumerate(
-            zip(input_ids_list, labels_list, weights_list)
-        ):
-            length = len(ids)
-            input_ids[i, :length] = torch.tensor(ids, dtype=torch.long)
+        for i in range(len(batch)):
+            length = len(input_ids_list[i])
+
+            input_ids[i, :length] = torch.tensor(input_ids_list[i], dtype=torch.long)
             attention_mask[i, :length] = 1
-            labels[i, :length] = torch.tensor(labs, dtype=torch.long)
-            loss_weights[i, :length] = torch.tensor(weights, dtype=torch.float)
+            labels[i, :length] = torch.tensor(labels_list[i], dtype=torch.long)
+            loss_weights[i, :length] = torch.tensor(weights_list[i], dtype=torch.float)
+            align_positions[i, :length] = torch.tensor(
+                align_positions_list[i],
+                dtype=torch.long,
+            )
+            align_coarse_labels[i, :length] = torch.tensor(
+                align_coarse_labels_list[i],
+                dtype=torch.long,
+            )
 
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
             "loss_weights": loss_weights,
+            "align_positions": align_positions,
+            "align_coarse_labels": align_coarse_labels,
         }
 
 
 class TestCollator(object):
     """
     Test collator remains prompt-only.
-    Target labels are returned separately for evaluate.py / test_ddp.py.
     """
 
     def __init__(self, args, tokenizer):

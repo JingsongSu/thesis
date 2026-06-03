@@ -1,11 +1,10 @@
 export WANDB_MODE=disabled
-# export CUDA_LAUNCH_BLOCKING=1
 export CUDA_VISIBLE_DEVICES=4,5,6,7
 
 DATASET=Instruments
 DATA_PATH=../data
 
-CKPT_PATH=/home/jovyan/ceph-1/sujinsong/sujinsong/thesis/LETTER-master/LETTER-LC-Rec/ckpt/Instruments-ceshi-4gpu/checkpoint-10300
+CKPT_PATH=./ckpt/Instruments-latent-tw32-tw8-4gpu/checkpoint-xxxx
 
 RESULTS_FILE=/home/jovyan/ceph-1/sujinsong/sujinsong/thesis/LETTER-master/LETTER-LC-Rec/results/$DATASET/ddp.json
 
@@ -24,4 +23,5 @@ torchrun --nproc_per_node=4 --master_port=4324 test_ddp.py \
     --index_file .tw32.json \
     --coarse_index_file .tw8.json \
     --interleaved_inference \
-    --interleaved_temperature 0.8
+    --interleaved_temperature 0.8 \
+    --use_bf16

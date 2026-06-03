@@ -87,23 +87,16 @@ class BaseDataset(Dataset):
                     self.coarse_indices = json.load(f)
 
     def get_new_tokens(self):
-        """
-        Must include both fine and coarse tokens.
-
-        Even though final decoding outputs only fine tokens, training target contains:
-            coarse_1 fine_1 coarse_2 fine_2 ...
-        """
         if self.new_tokens is not None:
             return self.new_tokens
 
         self.new_tokens = set()
 
-        if hasattr(self, "indices") and self.indices is not None:
-            for index in self.indices.values():
-                for token in index:
-                    self.new_tokens.add(token)
+        for index in self.indices.values():
+            for token in index:
+                self.new_tokens.add(token)
 
-        if hasattr(self, "coarse_indices") and self.coarse_indices is not None:
+        if self.coarse_indices is not None:
             for index in self.coarse_indices.values():
                 for token in index:
                     self.new_tokens.add(token)
@@ -112,19 +105,16 @@ class BaseDataset(Dataset):
         return self.new_tokens
 
     def get_all_items(self):
-        """
-        For implicit interleaved inference, final visible output is fine-only.
-        Therefore item filtering should use fine-only item codes.
-        """
         if self.all_items is not None:
             return self.all_items
 
         self.all_items = set()
 
         for index in self.indices.values():
-            self.all_items.add(code_tokens_to_text(index))
+            self.all_items.add("".join(index))
 
         return self.all_items
+
 
     def get_prefix_allowed_tokens_fn(self, tokenizer):
         """
@@ -193,18 +183,21 @@ class BaseDataset(Dataset):
     def _process_data(self):
         raise NotImplementedError
 
-
 class SeqRecDataset(BaseDataset):
     """
-    Sequential recommendation dataset for implicit interleaved reasoning.
+    SeqRec dataset for Qwen latent coarse-to-fine training.
 
     Train / valid:
-        input  = fine-code history
-        target = coarse_1 fine_1 coarse_2 fine_2 ...
+        input:
+            fine-code history prompt
+        labels:
+            fine_tokens and coarse_tokens separately
 
     Test:
-        input  = fine-code history
-        target = fine-code next item
+        input:
+            fine-code history prompt
+        target:
+            fine-code text
     """
 
     def __init__(self, args, mode="train", prompt_sample_num=1, prompt_id=0, sample_num=-1):
@@ -245,42 +238,49 @@ class SeqRecDataset(BaseDataset):
                 with open(coarse_path, "r") as f:
                     self.coarse_indices = json.load(f)
 
+        if self.coarse_indices is None:
+            raise ValueError(
+                "Latent interleaved training requires coarse_indices. "
+                "Please pass --coarse_index_file, e.g. --coarse_index_file .tw8.json"
+            )
+
     def _remap_items(self):
-        self.remapped_inters = {}
-        self.remapped_coarse_inters = {}
-        self.remapped_interleaved_inters = {}
+        self.remapped_fine_texts = {}
+        self.remapped_coarse_texts = {}
+        self.remapped_fine_tokens = {}
+        self.remapped_coarse_tokens = {}
 
         for uid, items in self.inters.items():
-            fine_items = []
-            coarse_items = []
-            interleaved_items = []
+            fine_texts = []
+            coarse_texts = []
+            fine_tokens = []
+            coarse_tokens = []
 
-            for raw_iid in items:
-                iid = str(raw_iid)
+            for i in items:
+                iid = str(i)
 
-                fine_tokens = self.indices[iid]
-                fine_text = code_tokens_to_text(fine_tokens)
-                fine_items.append(fine_text)
+                f_tokens = self.indices[iid]
+                c_tokens = self.coarse_indices[iid]
 
-                if self.coarse_indices is not None:
-                    coarse_tokens = self.coarse_indices[iid]
-                    coarse_text = code_tokens_to_text(coarse_tokens)
-                    interleaved_text = build_interleaved_code_text(
-                        fine_tokens=fine_tokens,
-                        coarse_tokens=coarse_tokens,
+                if len(f_tokens) != len(c_tokens):
+                    raise ValueError(
+                        f"fine/coarse code length mismatch for item {iid}: "
+                        f"{len(f_tokens)} vs {len(c_tokens)}"
                     )
-                else:
-                    coarse_text = None
-                    interleaved_text = fine_text
 
-                coarse_items.append(coarse_text)
-                interleaved_items.append(interleaved_text)
+                fine_tokens.append(f_tokens)
+                coarse_tokens.append(c_tokens)
+                fine_texts.append("".join(f_tokens))
+                coarse_texts.append("".join(c_tokens))
 
-            self.remapped_inters[uid] = fine_items
-            self.remapped_coarse_inters[uid] = coarse_items
-            self.remapped_interleaved_inters[uid] = interleaved_items
+            self.remapped_fine_texts[uid] = fine_texts
+            self.remapped_coarse_texts[uid] = coarse_texts
+            self.remapped_fine_tokens[uid] = fine_tokens
+            self.remapped_coarse_tokens[uid] = coarse_tokens
 
-    def _format_history(self, history):
+    def _make_history_text(self, fine_items):
+        history = fine_items
+
         if self.max_his_len > 0:
             history = history[-self.max_his_len:]
 
@@ -293,95 +293,76 @@ class SeqRecDataset(BaseDataset):
         return self.his_sep.join(history)
 
     def _process_train_data(self):
-        """
-        Key modification:
-            old:
-                fine_history   -> next_fine
-                coarse_history -> next_coarse
-
-            new:
-                fine_history -> coarse_1 fine_1 coarse_2 fine_2 ...
-        """
         inter_data = []
 
-        for uid in self.remapped_inters:
-            fine_items = self.remapped_inters[uid][:-2]
-            interleaved_items = self.remapped_interleaved_inters[uid][:-2]
+        for uid in self.remapped_fine_texts:
+            fine_texts = self.remapped_fine_texts[uid][:-2]
+            fine_tokens = self.remapped_fine_tokens[uid][:-2]
+            coarse_tokens = self.remapped_coarse_tokens[uid][:-2]
+            coarse_texts = self.remapped_coarse_texts[uid][:-2]
 
-            for i in range(1, len(fine_items)):
+            for i in range(1, len(fine_texts)):
                 one_data = {}
 
-                history = fine_items[:i]
-                one_data["inters"] = self._format_history(history)
+                history = fine_texts[:i]
 
-                one_data["item"] = interleaved_items[i]
+                one_data["inters"] = self._make_history_text(history)
 
-                # debug fields
-                one_data["fine_item"] = fine_items[i]
-                one_data["interleaved_item"] = interleaved_items[i]
+                # Prompt compatibility.
+                one_data["item"] = fine_texts[i]
+                one_data["coarse_item"] = coarse_texts[i]
+
+                # Real training labels.
+                one_data["fine_tokens"] = fine_tokens[i]
+                one_data["coarse_tokens"] = coarse_tokens[i]
 
                 inter_data.append(one_data)
-
-        if self.sample_num > 0:
-            all_idx = range(len(inter_data))
-            sample_idx = np.random.choice(all_idx, self.sample_num, replace=False)
-            inter_data = np.array(inter_data)[sample_idx].tolist()
 
         return inter_data
 
     def _process_valid_data(self):
-        """
-        Eval loss should match the training objective.
-        Therefore valid target is also interleaved code.
-        """
         inter_data = []
 
-        for uid in self.remapped_inters:
-            fine_items = self.remapped_inters[uid]
-            interleaved_items = self.remapped_interleaved_inters[uid]
+        for uid in self.remapped_fine_texts:
+            fine_texts = self.remapped_fine_texts[uid]
+            coarse_texts = self.remapped_coarse_texts[uid]
+            fine_tokens = self.remapped_fine_tokens[uid]
+            coarse_tokens = self.remapped_coarse_tokens[uid]
 
             one_data = {}
-            history = fine_items[:-2]
 
-            one_data["inters"] = self._format_history(history)
-            one_data["item"] = interleaved_items[-2]
+            history = fine_texts[:-2]
 
-            # debug fields
-            one_data["fine_item"] = fine_items[-2]
-            one_data["interleaved_item"] = interleaved_items[-2]
+            one_data["inters"] = self._make_history_text(history)
+            one_data["item"] = fine_texts[-2]
+            one_data["coarse_item"] = coarse_texts[-2]
+            one_data["fine_tokens"] = fine_tokens[-2]
+            one_data["coarse_tokens"] = coarse_tokens[-2]
 
             inter_data.append(one_data)
-
-        if self.sample_num > 0:
-            all_idx = range(len(inter_data))
-            sample_idx = np.random.choice(all_idx, self.sample_num, replace=False)
-            inter_data = np.array(inter_data)[sample_idx].tolist()
 
         return inter_data
 
     def _process_test_data(self):
-        """
-        Test target remains fine-only because final visible output is fine-only.
-        coarse_item is kept only for debug / optional analysis.
-        """
         inter_data = []
 
-        for uid in self.remapped_inters:
-            fine_items = self.remapped_inters[uid]
-            coarse_items = self.remapped_coarse_inters[uid]
+        for uid in self.remapped_fine_texts:
+            fine_texts = self.remapped_fine_texts[uid]
+            coarse_texts = self.remapped_coarse_texts[uid]
 
             one_data = {}
-            one_data["item"] = fine_items[-1]
-            one_data["coarse_item"] = coarse_items[-1] if coarse_items is not None else None
 
-            history = fine_items[:-1]
-            one_data["inters"] = self._format_history(history)
+            one_data["item"] = fine_texts[-1]
+            one_data["coarse_item"] = coarse_texts[-1]
+
+            history = fine_texts[:-1]
+            one_data["inters"] = self._make_history_text(history)
 
             inter_data.append(one_data)
 
         if self.sample_num > 0:
-            all_idx = range(len(inter_data))
-            sample_idx = np.random.choice(all_idx, self.sample_num, replace=False)
+            all_inter_idx = range(len(inter_data))
+            sample_idx = np.random.choice(all_inter_idx, self.sample_num, replace=False)
             inter_data = np.array(inter_data)[sample_idx].tolist()
 
         return inter_data
@@ -405,51 +386,47 @@ class SeqRecDataset(BaseDataset):
         if self.sample_valid:
             all_prompt_ids = range(len(self.prompts))
 
-            for d in self.inter_data:
+            for i in range(len(self.inter_data)):
+                d = self.inter_data[i]
                 prompt_ids = np.random.choice(
                     all_prompt_ids,
                     self.prompt_sample_num,
                     replace=False,
                 )
+
                 for prompt_id in prompt_ids:
                     prompt = self.prompts[prompt_id]
-                    input_text, output_text = self._get_text_data(d, prompt)
-                    self.valid_text_data.append(
-                        {
-                            "input_ids": input_text,
-                            "labels": output_text,
-                        }
-                    )
+                    input_text, _ = self._get_text_data(d, prompt)
+
+                    self.valid_text_data.append({
+                        "input_ids": input_text,
+                        "fine_tokens": d["fine_tokens"],
+                        "coarse_tokens": d["coarse_tokens"],
+                    })
         else:
             self.prompt_sample_num = 1
             prompt = self.prompts[self.valid_prompt_id]
 
-            for d in self.inter_data:
-                input_text, output_text = self._get_text_data(d, prompt)
-                self.valid_text_data.append(
-                    {
-                        "input_ids": input_text,
-                        "labels": output_text,
-                    }
-                )
+            for i in range(len(self.inter_data)):
+                d = self.inter_data[i]
+                input_text, _ = self._get_text_data(d, prompt)
+
+                self.valid_text_data.append({
+                    "input_ids": input_text,
+                    "fine_tokens": d["fine_tokens"],
+                    "coarse_tokens": d["coarse_tokens"],
+                })
 
     def _get_text_data(self, data, prompt):
         instruction = prompt["instruction"].format(**data)
         response = prompt["response"].format(**data)
 
-        input_text = sft_prompt.format(
-            instruction=instruction,
-            response="",
-        )
-        output_text = sft_prompt.format(
-            instruction=instruction,
-            response=response,
-        )
+        input_text = sft_prompt.format(instruction=instruction, response="")
 
         if self.mode == "test":
             return input_text, response
 
-        return input_text, output_text
+        return input_text, response
 
     def __getitem__(self, index):
         if self.mode == "valid":
@@ -468,15 +445,18 @@ class SeqRecDataset(BaseDataset):
         prompt = self.prompts[prompt_id]
         input_text, output_text = self._get_text_data(d, prompt)
 
-        out = {
-            "input_ids": input_text,
-            "labels": output_text,
-        }
-
         if self.mode == "test":
-            out["coarse_labels"] = d.get("coarse_item", None)
+            return {
+                "input_ids": input_text,
+                "labels": output_text,
+                "coarse_labels": d.get("coarse_item", None),
+            }
 
-        return out
+        return {
+            "input_ids": input_text,
+            "fine_tokens": d["fine_tokens"],
+            "coarse_tokens": d["coarse_tokens"],
+        }
 
 
 class SeqRecTestDataset(SeqRecDataset):

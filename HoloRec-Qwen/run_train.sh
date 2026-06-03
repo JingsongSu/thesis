@@ -6,7 +6,7 @@ DATASET=Instruments
 BASE_MODEL=/home/jovyan/ceph-1/sujinsong/sujinsong/thesis/LETTER-master/Qwen3-1-7B
 DATA_PATH=../data
 
-OUTPUT_DIR=./ckpt/$DATASET-ceshi-4gpu/
+OUTPUT_DIR=./ckpt/$DATASET-ceshi-v2-4gpu/
 
 torchrun --nproc_per_node=4 --master_port=3326 lora_finetune.py \
     --base_model $BASE_MODEL \
@@ -22,4 +22,7 @@ torchrun --nproc_per_node=4 --master_port=3326 lora_finetune.py \
     --index_file .tw32.json \
     --coarse_index_file .tw8.json \
     --wandb_run_name Instruments-interleaved-tw32tw8 \
-    --temperature 0.8
+    --temperature 0.8 \
+    --coarse_loss_weight 0.5 \
+    --fine_loss_weight 1.0 \
+    --coarse_align_weight 10.0

@@ -25,12 +25,68 @@ from collator import Collator
 from modeling_qwen_latent import InterleavedLatentQwen
 
 
+def patch_transformers_peft_detection_for_latent_wrapper():
+    """
+    Transformers Trainer refuses to train quantized models unless the top-level
+    model passes `_is_peft_model`.
+
+    Our top-level model is InterleavedLatentQwen, while the real PeftModel is
+    stored inside `model.base_model`.  The default Trainer check can therefore
+    incorrectly treat it as a purely quantized model.
+
+    This patch makes Trainer accept wrappers that contain a PeftModel submodule.
+    It must be called on every DDP rank before constructing transformers.Trainer.
+    """
+    try:
+        import transformers.trainer as trainer_mod
+        import transformers.trainer_utils as trainer_utils_mod
+        from peft import PeftModel
+
+        try:
+            from peft import PeftMixedModel
+            peft_types = (PeftModel, PeftMixedModel)
+        except Exception:
+            peft_types = (PeftModel,)
+
+        def _is_peft_model_or_contains_peft(model):
+            if isinstance(model, peft_types):
+                return True
+
+            inner = getattr(model, "base_model", None)
+            if isinstance(inner, peft_types):
+                return True
+
+            if inner is not None:
+                inner_inner = getattr(inner, "base_model", None)
+                if isinstance(inner_inner, peft_types):
+                    return True
+
+            modules_fn = getattr(model, "modules", None)
+            if callable(modules_fn):
+                for module in modules_fn():
+                    if module is model:
+                        continue
+                    if isinstance(module, peft_types):
+                        return True
+
+            return False
+
+        trainer_mod._is_peft_model = _is_peft_model_or_contains_peft
+        trainer_utils_mod._is_peft_model = _is_peft_model_or_contains_peft
+
+    except Exception as e:
+        print("[warning] failed to patch Trainer PEFT detection:", repr(e))
+
+
 def _flatten_tokenizer_ids(encoded):
     ids = encoded.get("input_ids", encoded)
+
     if isinstance(ids, torch.Tensor):
         ids = ids.tolist()
+
     if len(ids) > 0 and isinstance(ids[0], list):
         ids = ids[0]
+
     return [int(x) for x in ids]
 
 
@@ -40,16 +96,21 @@ def token_to_id(tokenizer, token):
     if token_id is None:
         encoded = tokenizer(token, add_special_tokens=False)
         ids = _flatten_tokenizer_ids(encoded)
+
         if len(ids) == 1:
             return int(ids[0])
+
         raise ValueError(f"Token {token!r} is not a single token: {ids}")
 
     unk_id = getattr(tokenizer, "unk_token_id", None)
+
     if unk_id is not None and int(token_id) == int(unk_id):
         encoded = tokenizer(token, add_special_tokens=False)
         ids = _flatten_tokenizer_ids(encoded)
+
         if len(ids) == 1:
             return int(ids[0])
+
         raise ValueError(f"Token {token!r} maps to unk or multiple ids: {ids}")
 
     return int(token_id)
@@ -64,7 +125,6 @@ def build_coarse_position_token_ids_from_dataset(dataset, tokenizer):
         coarse_position_token_ids[pos] contains all allowed coarse token ids
         at latent coarse position `pos`.
     """
-
     if not hasattr(dataset, "coarse_indices") or dataset.coarse_indices is None:
         raise ValueError(
             "Dataset has no coarse_indices. "
@@ -94,12 +154,9 @@ def prepare_kbit_model_for_latent_cache(model):
     Keep k-bit preparation, but do not enable gradient checkpointing.
 
     The latent wrapper calls the same base model multiple times inside one
-    forward. Current repository comments already note that repeated inner model
-    calls plus DeepSpeed ZeRO and gradient checkpointing can trigger parameter
-    reduction conflicts. The cache-based wrapper reduces recomputation, but
-    still should not use gradient checkpointing.
+    forward. Gradient checkpointing plus repeated inner model calls can trigger
+    parameter reduction conflicts, especially with DeepSpeed ZeRO.
     """
-
     try:
         model = prepare_model_for_kbit_training(
             model,
@@ -130,8 +187,8 @@ def build_training_args(args, ddp: bool):
     - gradient_checkpointing=False because latent wrapper repeatedly calls model.
     - remove_unused_columns=False because Trainer must keep fine_labels/coarse_labels.
     """
-
     report_to = []
+
     if getattr(args, "report_to", "wandb") and args.report_to.lower() != "none":
         report_to = [x.strip() for x in args.report_to.split(",") if x.strip()]
 
@@ -195,7 +252,27 @@ def make_quant_config(args, compute_dtype):
 def split_arg_list(value):
     if value is None:
         return []
+
     return [x.strip() for x in value.split(",") if x.strip()]
+
+
+def expose_peft_metadata_to_wrapper(wrapper_model, peft_model):
+    """
+    Make the latent wrapper look adapter-aware to utilities that inspect
+    PEFT-related attributes on the top-level model.
+    """
+    if hasattr(peft_model, "peft_config"):
+        wrapper_model.peft_config = peft_model.peft_config
+
+    if hasattr(peft_model, "active_adapter"):
+        wrapper_model.active_adapter = peft_model.active_adapter
+
+    if hasattr(peft_model, "active_adapters"):
+        wrapper_model.active_adapters = peft_model.active_adapters
+
+    wrapper_model._hf_peft_config_loaded = True
+
+    return wrapper_model
 
 
 def train(args):
@@ -212,6 +289,7 @@ def train(args):
     device_map = {"": local_rank} if ddp else "auto"
 
     compute_dtype = torch.float32
+
     if args.bf16:
         compute_dtype = torch.bfloat16
     elif args.fp16:
@@ -232,8 +310,7 @@ def train(args):
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-
-    tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
+        tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
 
     train_data, valid_data = load_datasets(args)
 
@@ -291,6 +368,7 @@ def train(args):
         base_model.config.use_cache = True
 
     lora_targets = split_arg_list(args.lora_target_modules)
+
     if len(lora_targets) == 0:
         lora_targets = [
             "qkv_proj",
@@ -304,10 +382,11 @@ def train(args):
         ]
 
     modules_to_save = split_arg_list(args.lora_modules_to_save)
+
     if len(modules_to_save) == 0:
         # Needed because new fine/coarse code tokens are added to tokenizer.
-        # Without this, resized embeddings / lm_head may stay frozen and not be
-        # saved into the LoRA checkpoint.
+        # Without this, resized embeddings / lm_head may stay frozen and may not
+        # be saved into the LoRA checkpoint.
         modules_to_save = ["embed_tokens", "lm_head"]
 
     lora_config = LoraConfig(
@@ -333,6 +412,7 @@ def train(args):
         if os.path.exists(checkpoint_name):
             if local_rank == 0:
                 print(f"Restarting from {checkpoint_name}")
+
             adapters_weights = torch.load(checkpoint_name, map_location="cpu")
             set_peft_model_state_dict(peft_model, adapters_weights)
         else:
@@ -377,6 +457,11 @@ def train(args):
 
     model.gradient_checkpointing_disable()
 
+    model = expose_peft_metadata_to_wrapper(model, peft_model)
+
+    # Important: call this before constructing Trainer on every DDP rank.
+    patch_transformers_peft_detection_for_latent_wrapper()
+
     training_args = build_training_args(args, ddp)
 
     trainer = transformers.Trainer(
@@ -402,6 +487,7 @@ def train(args):
 
 def add_arg_if_absent(parser, *flags, **kwargs):
     existing = set()
+
     for action in parser._actions:
         existing.update(action.option_strings)
 
@@ -409,6 +495,7 @@ def add_arg_if_absent(parser, *flags, **kwargs):
         return parser
 
     parser.add_argument(*flags, **kwargs)
+
     return parser
 
 
@@ -432,18 +519,21 @@ if __name__ == "__main__":
         type=float,
         default=1.0,
     )
+
     add_arg_if_absent(
         parser,
         "--fine_loss_weight",
         type=float,
         default=1.0,
     )
+
     add_arg_if_absent(
         parser,
         "--coarse_align_weight",
         type=float,
         default=2.0,
     )
+
     add_arg_if_absent(
         parser,
         "--temperature",
@@ -457,12 +547,14 @@ if __name__ == "__main__":
         action="store_true",
         default=True,
     )
+
     add_arg_if_absent(
         parser,
         "--no_load_in_8bit",
         action="store_false",
         dest="load_in_8bit",
     )
+
     add_arg_if_absent(
         parser,
         "--load_in_4bit",
@@ -476,18 +568,21 @@ if __name__ == "__main__":
         type=str,
         default="flash_attention_2",
     )
+
     add_arg_if_absent(
         parser,
         "--report_to",
         type=str,
         default="wandb",
     )
+
     add_arg_if_absent(
         parser,
         "--save_total_limit",
         type=int,
         default=8,
     )
+
     add_arg_if_absent(
         parser,
         "--no_train_cache",

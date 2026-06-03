@@ -1,51 +1,171 @@
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-
 IGNORE_INDEX = -100
 
 
-def _to_list(x):
-    if x is None:
-        return []
-    if isinstance(x, (list, tuple, set)):
-        return list(x)
-    return [x]
+def _model_device(model: nn.Module) -> torch.device:
+    try:
+        return next(model.parameters()).device
+    except StopIteration:
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _get_input_embeddings(model: nn.Module) -> nn.Module:
+    if hasattr(model, "get_input_embeddings"):
+        emb = model.get_input_embeddings()
+        if emb is not None:
+            return emb
+
+    if hasattr(model, "base_model") and hasattr(model.base_model, "get_input_embeddings"):
+        emb = model.base_model.get_input_embeddings()
+        if emb is not None:
+            return emb
+
+    if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
+        return model.model.embed_tokens
+
+    raise ValueError("Cannot locate input embeddings on base model.")
+
+
+def _get_output_embeddings(model: nn.Module) -> Optional[nn.Module]:
+    if hasattr(model, "get_output_embeddings"):
+        emb = model.get_output_embeddings()
+        if emb is not None:
+            return emb
+
+    if hasattr(model, "base_model") and hasattr(model.base_model, "get_output_embeddings"):
+        emb = model.base_model.get_output_embeddings()
+        if emb is not None:
+            return emb
+
+    if hasattr(model, "lm_head"):
+        return model.lm_head
+
+    if hasattr(model, "model") and hasattr(model.model, "lm_head"):
+        return model.model.lm_head
+
+    return None
+
+
+def _get_active_adapter_name(module: nn.Module):
+    active = getattr(module, "active_adapter", None)
+
+    if callable(active):
+        try:
+            active = active()
+        except TypeError:
+            pass
+
+    if isinstance(active, (list, tuple)):
+        if len(active) == 0:
+            return None
+        return active[0]
+
+    return active
+
+
+def _get_wrapped_module_weight(module: nn.Module) -> torch.Tensor:
+    """
+    Return `.weight` from normal modules and PEFT ModulesToSaveWrapper.
+
+    With LoRA + modules_to_save=["embed_tokens", "lm_head"], PEFT may replace
+    the embedding/lm_head with ModulesToSaveWrapper. That wrapper can be called
+    in forward, but it does not expose `.weight` directly.
+    """
+    if hasattr(module, "weight"):
+        weight = getattr(module, "weight")
+        if isinstance(weight, torch.Tensor):
+            return weight
+        if isinstance(weight, nn.Parameter):
+            return weight
+
+    modules_to_save = getattr(module, "modules_to_save", None)
+
+    if modules_to_save is not None:
+        active = _get_active_adapter_name(module)
+
+        if active is not None and active in modules_to_save:
+            sub = modules_to_save[active]
+            if hasattr(sub, "weight"):
+                return sub.weight
+
+        if "default" in modules_to_save:
+            sub = modules_to_save["default"]
+            if hasattr(sub, "weight"):
+                return sub.weight
+
+        try:
+            for _, sub in modules_to_save.items():
+                if hasattr(sub, "weight"):
+                    return sub.weight
+        except Exception:
+            pass
+
+    original_module = getattr(module, "original_module", None)
+    if original_module is not None and hasattr(original_module, "weight"):
+        return original_module.weight
+
+    base_layer = getattr(module, "base_layer", None)
+    if base_layer is not None and hasattr(base_layer, "weight"):
+        return base_layer.weight
+
+    raise AttributeError(
+        f"Cannot locate `.weight` inside module type {type(module).__name__}. "
+        "This is usually caused by an unsupported PEFT wrapper around embeddings."
+    )
+
+
+def _last_non_pad_logits(logits: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    """
+    Return logits at the last real prompt token for each row.
+
+    Works for both left padding and right padding.
+    """
+    seq_len = attention_mask.size(1)
+    pos = torch.arange(seq_len, device=attention_mask.device).view(1, -1)
+    pos = pos.expand_as(attention_mask)
+    last_pos = pos.masked_fill(attention_mask.eq(0), -1).max(dim=1).values
+    last_pos = last_pos.clamp(min=0)
+
+    gather_idx = last_pos.view(-1, 1, 1).expand(-1, 1, logits.size(-1))
+    return logits.gather(dim=1, index=gather_idx).squeeze(1)
 
 
 class InterleavedLatentQwen(nn.Module):
     """
-    Implicit interleaved latent wrapper for HoloRec-Qwen.
+    Prompt-only implicit HoloRec-Qwen wrapper.
 
-    Visible decoded sequence:
-        fine_1 fine_2 fine_3 ...
+    Visible sequence:
+        prompt + fine tokens
 
-    Hidden latent procedure:
-        context -> coarse logits
-        coarse logits -> soft coarse embedding
-        context + soft coarse embedding -> fine logits
-        context + soft coarse embedding + gold fine -> next latent coarse step
+    Hidden transition per item-code position:
+        state_t
+        -> coarse_logits_t over position-specific coarse codebook
+        -> soft latent coarse embedding_t
+        -> fine_logits_t
+        -> gold fine embedding_t during training
+        -> state_{t+1}
 
-    Coarse tokens are not placed into visible input_ids and are not decoded.
-    They only supervise the latent coarse step.
+    Coarse tokens are never decoded as visible tokens.
     """
 
     def __init__(
         self,
-        base_model,
+        base_model: nn.Module,
         pad_token_id: int,
-        temperature: float = 1.0,
+        temperature: float = 0.8,
         coarse_loss_weight: float = 1.0,
         fine_loss_weight: float = 1.0,
-        coarse_align_weight: float = 2.0,
+        coarse_align_weight: float = 0.0,
         use_train_cache: bool = True,
+        **unused_kwargs,
     ):
         super().__init__()
-
         self.base_model = base_model
         self.pad_token_id = int(pad_token_id)
         self.temperature = float(temperature)
@@ -53,579 +173,466 @@ class InterleavedLatentQwen(nn.Module):
         self.fine_loss_weight = float(fine_loss_weight)
         self.coarse_align_weight = float(coarse_align_weight)
         self.use_train_cache = bool(use_train_cache)
-
         self.config = getattr(base_model, "config", None)
 
-        self.coarse_position_token_ids: Optional[List[List[int]]] = None
-        self._coarse_codebook_cache = {}
+        self.coarse_position_token_ids: List[torch.Tensor] = []
+        self.coarse_id_to_local: List[torch.Tensor] = []
 
-    def set_codebooks(self, coarse_position_token_ids: List[List[int]]):
-        if coarse_position_token_ids is None or len(coarse_position_token_ids) == 0:
-            raise ValueError("coarse_position_token_ids must be non-empty.")
-
-        self.coarse_position_token_ids = [
-            [int(x) for x in ids]
-            for ids in coarse_position_token_ids
-        ]
-
-        self._coarse_codebook_cache = {}
-
-    def get_input_embeddings(self):
-        return self.base_model.get_input_embeddings()
-
-    def get_output_embeddings(self):
-        if hasattr(self.base_model, "get_output_embeddings"):
-            return self.base_model.get_output_embeddings()
-        return None
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError as exc:
+            base_model = self.__dict__.get("_modules", {}).get("base_model", None)
+            if base_model is not None and hasattr(base_model, name):
+                return getattr(base_model, name)
+            raise exc
 
     def gradient_checkpointing_enable(self, *args, **kwargs):
-        if hasattr(self.base_model, "gradient_checkpointing_enable"):
-            return self.base_model.gradient_checkpointing_enable(*args, **kwargs)
+        """
+        Keep disabled.
+
+        This wrapper calls the same base/PEFT model multiple times in one forward.
+        Gradient checkpointing plus ZeRO can produce repeated reduction errors,
+        and gradient checkpointing is also incompatible with cache-based training.
+        """
+        if hasattr(self.base_model, "gradient_checkpointing_disable"):
+            self.base_model.gradient_checkpointing_disable()
 
     def gradient_checkpointing_disable(self):
         if hasattr(self.base_model, "gradient_checkpointing_disable"):
-            return self.base_model.gradient_checkpointing_disable()
+            self.base_model.gradient_checkpointing_disable()
+
+    def get_input_embeddings(self):
+        return _get_input_embeddings(self.base_model)
+
+    def get_output_embeddings(self):
+        return _get_output_embeddings(self.base_model)
+
+    def get_input_embedding_weight(self) -> torch.Tensor:
+        return _get_wrapped_module_weight(self.get_input_embeddings())
+
+    def get_output_embedding_weight(self) -> Optional[torch.Tensor]:
+        out = self.get_output_embeddings()
+        if out is None:
+            return None
+        return _get_wrapped_module_weight(out)
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Use module forward instead of direct F.embedding so PEFT wrappers remain valid.
+        """
+        return self.get_input_embeddings()(input_ids)
 
     def save_pretrained(self, *args, **kwargs):
-        return self.base_model.save_pretrained(*args, **kwargs)
+        if hasattr(self.base_model, "save_pretrained"):
+            return self.base_model.save_pretrained(*args, **kwargs)
+        raise AttributeError("base_model has no save_pretrained")
 
-    def _unwrap_modules_to_save_embedding(self, module):
+    def set_codebooks(self, coarse_position_token_ids: Sequence[Sequence[int]]):
         """
-        PEFT may wrap embed_tokens with ModulesToSaveWrapper when using:
+        Register per-position coarse candidate ids.
 
-            modules_to_save=["embed_tokens", "lm_head"]
-
-        ModulesToSaveWrapper itself has no `.weight`, but its active adapter
-        module does. This helper returns the real nn.Embedding module.
+        coarse_position_token_ids[pos] is the valid coarse-token id list for
+        position pos. Buffers are non-persistent, so checkpoints stay clean.
         """
+        for name in list(self._buffers.keys()):
+            if name.startswith("coarse_ids_") or name.startswith("coarse_map_"):
+                del self._buffers[name]
 
-        if hasattr(module, "weight"):
-            return module
+        self.coarse_position_token_ids = []
+        self.coarse_id_to_local = []
 
-        modules_to_save = getattr(module, "modules_to_save", None)
+        vocab_size = int(getattr(getattr(self.base_model, "config", None), "vocab_size", 0) or 0)
 
-        if modules_to_save is not None:
-            active_names = []
+        if vocab_size <= 0:
+            out_weight = self.get_output_embedding_weight()
+            if out_weight is not None:
+                vocab_size = int(out_weight.size(0))
+            else:
+                vocab_size = int(self.get_input_embedding_weight().size(0))
 
-            if hasattr(module, "active_adapter"):
-                active_adapter = getattr(module, "active_adapter")
-                active_names.extend(_to_list(active_adapter))
+        for pos, ids in enumerate(coarse_position_token_ids):
+            ids_tensor = torch.tensor([int(x) for x in ids], dtype=torch.long)
 
-            if hasattr(module, "active_adapters"):
-                active_adapters = getattr(module, "active_adapters")
-                if callable(active_adapters):
-                    try:
-                        active_adapters = active_adapters()
-                    except TypeError:
-                        active_adapters = None
-                active_names.extend(_to_list(active_adapters))
-
-            if hasattr(module, "_active_adapter"):
-                active_names.extend(_to_list(getattr(module, "_active_adapter")))
-
-            seen = set()
-            active_names = [
-                str(x) for x in active_names
-                if x is not None and str(x) not in seen and not seen.add(str(x))
-            ]
-
-            for name in active_names:
-                if name in modules_to_save:
-                    candidate = modules_to_save[name]
-                    if hasattr(candidate, "weight"):
-                        return candidate
-
-            for _, candidate in modules_to_save.items():
-                if hasattr(candidate, "weight"):
-                    return candidate
-
-        original_module = getattr(module, "original_module", None)
-        if original_module is not None and hasattr(original_module, "weight"):
-            return original_module
-
-        raise AttributeError(
-            "Cannot find real embedding weight from input embeddings. "
-            f"Got module type: {type(module).__name__}. "
-            "If this is a PEFT ModulesToSaveWrapper, please make sure it contains "
-            "an active embedding module in `modules_to_save` or `original_module`."
-        )
-
-    def _get_embedding_module(self):
-        embedding_module = self.get_input_embeddings()
-        return self._unwrap_modules_to_save_embedding(embedding_module)
-
-    def _get_embedding_weight(self):
-        return self._get_embedding_module().weight
-
-    def _embed_token_ids(self, token_ids: torch.Tensor) -> torch.Tensor:
-        return self._get_embedding_module()(token_ids)
-
-    def _append_attention(self, attention_mask: torch.Tensor) -> torch.Tensor:
-        ones = torch.ones(
-            (attention_mask.size(0), 1),
-            dtype=attention_mask.dtype,
-            device=attention_mask.device,
-        )
-        return torch.cat([attention_mask, ones], dim=1)
-
-    def _get_codebook_tensor(self, pos: int, device: torch.device) -> torch.Tensor:
-        if self.coarse_position_token_ids is None:
-            raise ValueError(
-                "coarse_position_token_ids is None. "
-                "Call model.set_codebooks(...) before training."
-            )
-
-        if pos >= len(self.coarse_position_token_ids):
-            raise ValueError(
-                f"Requested coarse codebook position {pos}, "
-                f"but only {len(self.coarse_position_token_ids)} positions exist."
-            )
-
-        key = (int(pos), str(device))
-
-        if key not in self._coarse_codebook_cache:
-            ids = self.coarse_position_token_ids[pos]
-            if len(ids) == 0:
+            if ids_tensor.numel() == 0:
                 raise ValueError(f"Empty coarse codebook at position {pos}.")
 
-            self._coarse_codebook_cache[key] = torch.tensor(
-                ids,
-                dtype=torch.long,
-                device=device,
-            )
+            max_id = int(ids_tensor.max().item())
+            if max_id >= vocab_size:
+                vocab_size = max_id + 1
 
-        return self._coarse_codebook_cache[key]
+            map_tensor = torch.full((vocab_size,), fill_value=-1, dtype=torch.long)
+            map_tensor[ids_tensor] = torch.arange(ids_tensor.numel(), dtype=torch.long)
 
-    def _target_indices_in_codebook(
+            self.register_buffer(f"coarse_ids_{pos}", ids_tensor, persistent=False)
+            self.register_buffer(f"coarse_map_{pos}", map_tensor, persistent=False)
+
+            self.coarse_position_token_ids.append(getattr(self, f"coarse_ids_{pos}"))
+            self.coarse_id_to_local.append(getattr(self, f"coarse_map_{pos}"))
+
+    def _call_base(
         self,
-        codebook_ids: torch.Tensor,
-        target_ids: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        valid = target_ids.ne(IGNORE_INDEX)
+        *,
+        input_ids: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values=None,
+        use_cache: Optional[bool] = None,
+    ):
+        if use_cache is None:
+            use_cache = self.use_train_cache
 
-        matches = codebook_ids.unsqueeze(0).eq(target_ids.unsqueeze(1))
-        in_codebook = matches.any(dim=1)
-        valid = valid & in_codebook
+        return self.base_model(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=bool(use_cache),
+            return_dict=True,
+            output_attentions=False,
+            output_hidden_states=False,
+        )
 
-        target_pos = matches.float().argmax(dim=1).long()
-
-        return target_pos, valid
-
-    def _coarse_step(
+    def _soft_coarse_embedding(
         self,
         coarse_logits: torch.Tensor,
-        target_coarse_ids: torch.Tensor,
         pos: int,
-    ):
-        """
-        coarse_logits:
-            [batch_size, vocab_size]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        code_pos = min(pos, len(self.coarse_position_token_ids) - 1)
+        candidate_ids = self.coarse_position_token_ids[code_pos].to(coarse_logits.device)
 
-        target_coarse_ids:
-            [batch_size]
+        candidate_logits = coarse_logits.index_select(dim=-1, index=candidate_ids)
 
-        Returns:
-            coarse_loss_sum
-            coarse_count
-            align_loss_sum
-            align_count
-            soft_coarse_embedding
-        """
+        probs = F.softmax(
+            candidate_logits.float() / max(self.temperature, 1e-6),
+            dim=-1,
+        ).to(coarse_logits.dtype)
 
-        device = coarse_logits.device
+        emb_weight = self.get_input_embedding_weight().to(coarse_logits.device)
 
-        codebook_ids = self._get_codebook_tensor(pos, device)
-        codebook_logits = coarse_logits.index_select(dim=-1, index=codebook_ids)
+        candidate_emb = emb_weight.index_select(dim=0, index=candidate_ids)
+        candidate_emb = candidate_emb.to(probs.dtype)
 
-        embedding_weight = self._get_embedding_weight()
-        codebook_embeds = embedding_weight.index_select(0, codebook_ids)
+        coarse_emb = probs @ candidate_emb
 
-        if self.temperature > 0:
-            codebook_logits_for_prob = codebook_logits.float() / self.temperature
-        else:
-            codebook_logits_for_prob = codebook_logits.float()
+        return coarse_emb, candidate_logits, candidate_ids, code_pos
 
-        codebook_probs = F.softmax(codebook_logits_for_prob, dim=-1).to(
-            dtype=codebook_embeds.dtype
-        )
+    def _coarse_ce(
+        self,
+        candidate_logits: torch.Tensor,
+        code_pos: int,
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
+        labels = labels.to(candidate_logits.device)
+        local = torch.full_like(labels, fill_value=IGNORE_INDEX)
 
-        soft_coarse_embeds = torch.matmul(codebook_probs, codebook_embeds)
-
-        target_pos, valid = self._target_indices_in_codebook(
-            codebook_ids=codebook_ids,
-            target_ids=target_coarse_ids,
-        )
+        valid = labels.ne(IGNORE_INDEX)
 
         if valid.any():
-            valid_logits = codebook_logits[valid].float()
-            valid_target_pos = target_pos[valid]
+            lookup = self.coarse_id_to_local[code_pos].to(labels.device)
 
-            coarse_loss_vec = F.cross_entropy(
-                valid_logits,
-                valid_target_pos,
-                reduction="none",
-            )
+            safe_labels = labels[valid]
+            in_range = (safe_labels >= 0) & (safe_labels < lookup.numel())
 
-            coarse_loss_sum = coarse_loss_vec.sum().to(dtype=coarse_logits.dtype)
-            coarse_count = valid.sum().to(dtype=coarse_logits.dtype)
+            mapped = torch.full_like(safe_labels, fill_value=IGNORE_INDEX)
 
-            safe_target_coarse_ids = target_coarse_ids.masked_fill(
-                target_coarse_ids.eq(IGNORE_INDEX),
-                self.pad_token_id,
-            )
+            if in_range.any():
+                mapped_in_range = lookup.index_select(0, safe_labels[in_range])
+                mapped[in_range] = mapped_in_range.masked_fill(mapped_in_range.lt(0), IGNORE_INDEX)
 
-            gold_coarse_embeds = self._embed_token_ids(safe_target_coarse_ids)
+            local[valid] = mapped
 
-            pred = soft_coarse_embeds[valid].float()
-            gold = gold_coarse_embeds[valid].float()
-
-            align_loss_vec = 1.0 - F.cosine_similarity(pred, gold, dim=-1)
-            align_loss_sum = align_loss_vec.sum().to(dtype=coarse_logits.dtype)
-            align_count = coarse_count
-        else:
-            coarse_loss_sum = coarse_logits.new_zeros(())
-            coarse_count = coarse_logits.new_zeros(())
-            align_loss_sum = coarse_logits.new_zeros(())
-            align_count = coarse_logits.new_zeros(())
-
-        return (
-            coarse_loss_sum,
-            coarse_count,
-            align_loss_sum,
-            align_count,
-            soft_coarse_embeds,
-        )
-
-    def _fine_step(
-        self,
-        fine_logits: torch.Tensor,
-        target_fine_ids: torch.Tensor,
-    ):
-        valid = target_fine_ids.ne(IGNORE_INDEX)
-
-        if not valid.any():
-            return fine_logits.new_zeros(()), fine_logits.new_zeros(())
-
-        loss_vec = F.cross_entropy(
-            fine_logits[valid].float(),
-            target_fine_ids[valid],
-            reduction="none",
-        )
-
-        return (
-            loss_vec.sum().to(dtype=fine_logits.dtype),
-            valid.sum().to(dtype=fine_logits.dtype),
-        )
-
-    def _forward_with_cache(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        fine_labels: torch.Tensor,
-        coarse_labels: torch.Tensor,
-    ):
-        code_len = fine_labels.size(1)
-
-        outputs = self.base_model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            use_cache=True,
-            return_dict=True,
-        )
-
-        past_key_values = outputs.past_key_values
-        next_logits = outputs.logits[:, -1, :]
-
-        cur_attention_mask = attention_mask
-
-        coarse_loss_sum = next_logits.new_zeros(())
-        coarse_count = next_logits.new_zeros(())
-        fine_loss_sum = next_logits.new_zeros(())
-        fine_count = next_logits.new_zeros(())
-        align_loss_sum = next_logits.new_zeros(())
-        align_count = next_logits.new_zeros(())
-
-        fine_logits_for_output = []
-
-        for pos in range(code_len):
-            target_coarse = coarse_labels[:, pos]
-            target_fine = fine_labels[:, pos]
-
-            (
-                c_loss_sum,
-                c_count,
-                a_loss_sum,
-                a_count,
-                soft_coarse_embeds,
-            ) = self._coarse_step(
-                coarse_logits=next_logits,
-                target_coarse_ids=target_coarse,
-                pos=pos,
-            )
-
-            coarse_loss_sum = coarse_loss_sum + c_loss_sum
-            coarse_count = coarse_count + c_count
-            align_loss_sum = align_loss_sum + a_loss_sum
-            align_count = align_count + a_count
-
-            cur_attention_mask = self._append_attention(cur_attention_mask)
-
-            outputs = self.base_model(
-                inputs_embeds=soft_coarse_embeds.unsqueeze(1),
-                attention_mask=cur_attention_mask,
-                past_key_values=past_key_values,
-                use_cache=True,
-                return_dict=True,
-            )
-
-            past_key_values = outputs.past_key_values
-            fine_logits = outputs.logits[:, -1, :]
-            fine_logits_for_output.append(fine_logits)
-
-            f_loss_sum, f_count = self._fine_step(
-                fine_logits=fine_logits,
-                target_fine_ids=target_fine,
-            )
-
-            fine_loss_sum = fine_loss_sum + f_loss_sum
-            fine_count = fine_count + f_count
-
-            if pos + 1 < code_len:
-                safe_fine_ids = target_fine.masked_fill(
-                    target_fine.eq(IGNORE_INDEX),
-                    self.pad_token_id,
-                )
-
-                fine_embeds = self._embed_token_ids(safe_fine_ids)
-
-                cur_attention_mask = self._append_attention(cur_attention_mask)
-
-                outputs = self.base_model(
-                    inputs_embeds=fine_embeds.unsqueeze(1),
-                    attention_mask=cur_attention_mask,
-                    past_key_values=past_key_values,
-                    use_cache=True,
-                    return_dict=True,
-                )
-
-                past_key_values = outputs.past_key_values
-                next_logits = outputs.logits[:, -1, :]
-
-        return (
-            coarse_loss_sum,
-            coarse_count,
-            fine_loss_sum,
-            fine_count,
-            align_loss_sum,
-            align_count,
-            fine_logits_for_output,
-        )
-
-    def _forward_no_cache(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        fine_labels: torch.Tensor,
-        coarse_labels: torch.Tensor,
-    ):
-        code_len = fine_labels.size(1)
-
-        cur_embeds = self._embed_token_ids(input_ids)
-        cur_attention_mask = attention_mask
-
-        coarse_loss_sum = cur_embeds.new_zeros(())
-        coarse_count = cur_embeds.new_zeros(())
-        fine_loss_sum = cur_embeds.new_zeros(())
-        fine_count = cur_embeds.new_zeros(())
-        align_loss_sum = cur_embeds.new_zeros(())
-        align_count = cur_embeds.new_zeros(())
-
-        fine_logits_for_output = []
-
-        for pos in range(code_len):
-            outputs = self.base_model(
-                inputs_embeds=cur_embeds,
-                attention_mask=cur_attention_mask,
-                use_cache=False,
-                return_dict=True,
-            )
-
-            coarse_logits = outputs.logits[:, -1, :]
-            target_coarse = coarse_labels[:, pos]
-            target_fine = fine_labels[:, pos]
-
-            (
-                c_loss_sum,
-                c_count,
-                a_loss_sum,
-                a_count,
-                soft_coarse_embeds,
-            ) = self._coarse_step(
-                coarse_logits=coarse_logits,
-                target_coarse_ids=target_coarse,
-                pos=pos,
-            )
-
-            coarse_loss_sum = coarse_loss_sum + c_loss_sum
-            coarse_count = coarse_count + c_count
-            align_loss_sum = align_loss_sum + a_loss_sum
-            align_count = align_count + a_count
-
-            cur_embeds = torch.cat(
-                [cur_embeds, soft_coarse_embeds.unsqueeze(1)],
-                dim=1,
-            )
-            cur_attention_mask = self._append_attention(cur_attention_mask)
-
-            outputs = self.base_model(
-                inputs_embeds=cur_embeds,
-                attention_mask=cur_attention_mask,
-                use_cache=False,
-                return_dict=True,
-            )
-
-            fine_logits = outputs.logits[:, -1, :]
-            fine_logits_for_output.append(fine_logits)
-
-            f_loss_sum, f_count = self._fine_step(
-                fine_logits=fine_logits,
-                target_fine_ids=target_fine,
-            )
-
-            fine_loss_sum = fine_loss_sum + f_loss_sum
-            fine_count = fine_count + f_count
-
-            if pos + 1 < code_len:
-                safe_fine_ids = target_fine.masked_fill(
-                    target_fine.eq(IGNORE_INDEX),
-                    self.pad_token_id,
-                )
-
-                fine_embeds = self._embed_token_ids(safe_fine_ids)
-
-                cur_embeds = torch.cat(
-                    [cur_embeds, fine_embeds.unsqueeze(1)],
-                    dim=1,
-                )
-                cur_attention_mask = self._append_attention(cur_attention_mask)
-
-        return (
-            coarse_loss_sum,
-            coarse_count,
-            fine_loss_sum,
-            fine_count,
-            align_loss_sum,
-            align_count,
-            fine_logits_for_output,
+        return F.cross_entropy(
+            candidate_logits.float(),
+            local,
+            ignore_index=IGNORE_INDEX,
+            reduction="mean",
         )
 
     def forward(
         self,
-        input_ids=None,
-        attention_mask=None,
-        fine_labels=None,
-        coarse_labels=None,
-        labels=None,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        fine_labels: Optional[torch.Tensor] = None,
+        coarse_labels: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         if fine_labels is None or coarse_labels is None:
-            raise ValueError(
-                "InterleavedLatentQwen requires `fine_labels` and `coarse_labels`. "
-                "Do not pass explicit interleaved labels."
+            return self.base_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                **kwargs,
             )
 
-        if input_ids is None:
-            raise ValueError("input_ids must be provided.")
-
-        if attention_mask is None:
-            attention_mask = input_ids.ne(self.pad_token_id).long()
-
-        if fine_labels.size() != coarse_labels.size():
-            raise ValueError(
-                f"fine_labels and coarse_labels must have same shape, got "
-                f"{tuple(fine_labels.size())} vs {tuple(coarse_labels.size())}"
-            )
+        if len(self.coarse_position_token_ids) == 0:
+            raise ValueError("Call InterleavedLatentQwen.set_codebooks(...) before training.")
 
         if self.use_train_cache:
-            try:
-                (
-                    coarse_loss_sum,
-                    coarse_count,
-                    fine_loss_sum,
-                    fine_count,
-                    align_loss_sum,
-                    align_count,
-                    fine_logits_for_output,
-                ) = self._forward_with_cache(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    fine_labels=fine_labels,
-                    coarse_labels=coarse_labels,
-                )
-            except (RuntimeError, TypeError, ValueError) as e:
-                print(
-                    "[InterleavedLatentQwen] cached latent forward failed; "
-                    f"fallback to no-cache forward. Error: {repr(e)}"
-                )
-
-                (
-                    coarse_loss_sum,
-                    coarse_count,
-                    fine_loss_sum,
-                    fine_count,
-                    align_loss_sum,
-                    align_count,
-                    fine_logits_for_output,
-                ) = self._forward_no_cache(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    fine_labels=fine_labels,
-                    coarse_labels=coarse_labels,
-                )
-        else:
-            (
-                coarse_loss_sum,
-                coarse_count,
-                fine_loss_sum,
-                fine_count,
-                align_loss_sum,
-                align_count,
-                fine_logits_for_output,
-            ) = self._forward_no_cache(
+            return self._forward_with_cache(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 fine_labels=fine_labels,
                 coarse_labels=coarse_labels,
             )
 
-        loss = coarse_loss_sum.float() * 0.0
-
-        loss = loss + self.coarse_loss_weight * (
-            coarse_loss_sum.float() / coarse_count.float().clamp_min(1.0)
+        return self._forward_recompute(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            fine_labels=fine_labels,
+            coarse_labels=coarse_labels,
         )
 
-        loss = loss + self.fine_loss_weight * (
-            fine_loss_sum.float() / fine_count.float().clamp_min(1.0)
+    def _forward_with_cache(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        fine_labels: torch.Tensor,
+        coarse_labels: torch.Tensor,
+    ):
+        device = _model_device(self.base_model)
+        input_ids = input_ids.to(device)
+
+        if attention_mask is None:
+            attention_mask = input_ids.ne(self.pad_token_id).long()
+
+        attention_mask = attention_mask.to(device)
+        fine_labels = fine_labels.to(device)
+        coarse_labels = coarse_labels.to(device)
+
+        outputs = self._call_base(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=True,
         )
 
-        if self.coarse_align_weight > 0:
-            loss = loss + self.coarse_align_weight * (
-                align_loss_sum.float() / align_count.float().clamp_min(1.0)
+        # Important:
+        # Do NOT convert this to legacy tuple.
+        # Qwen3 expects a Cache/DynamicCache object and calls get_seq_length().
+        past = outputs.past_key_values
+
+        coarse_logits = _last_non_pad_logits(outputs.logits, attention_mask)
+        cur_attention = attention_mask
+
+        total_loss = coarse_logits.new_zeros(())
+        total_weight = 0.0
+        fine_logits_for_return = []
+        code_len = fine_labels.size(1)
+
+        for pos in range(code_len):
+            gold_coarse = coarse_labels[:, pos]
+            gold_fine = fine_labels[:, pos]
+
+            active = gold_fine.ne(IGNORE_INDEX) & gold_coarse.ne(IGNORE_INDEX)
+            if not active.any():
+                break
+
+            coarse_emb, candidate_logits, _candidate_ids, code_pos = self._soft_coarse_embedding(
+                coarse_logits=coarse_logits,
+                pos=pos,
             )
 
-        if len(fine_logits_for_output) > 0:
-            logits = torch.stack(fine_logits_for_output, dim=1)
+            coarse_loss = self._coarse_ce(
+                candidate_logits=candidate_logits,
+                code_pos=code_pos,
+                labels=gold_coarse,
+            )
+
+            coarse_w = self.coarse_loss_weight + self.coarse_align_weight
+
+            if coarse_w != 0.0:
+                total_loss = total_loss + coarse_w * coarse_loss
+                total_weight += abs(coarse_w)
+
+            one = torch.ones(
+                (input_ids.size(0), 1),
+                dtype=cur_attention.dtype,
+                device=cur_attention.device,
+            )
+
+            attention_after_coarse = torch.cat([cur_attention, one], dim=1)
+
+            out_after_coarse = self._call_base(
+                inputs_embeds=coarse_emb.unsqueeze(1),
+                attention_mask=attention_after_coarse,
+                past_key_values=past,
+                use_cache=True,
+            )
+
+            # Keep Cache/DynamicCache object.
+            past_after_coarse = out_after_coarse.past_key_values
+
+            fine_logits = out_after_coarse.logits[:, -1, :]
+            fine_logits_for_return.append(fine_logits.unsqueeze(1))
+
+            fine_loss = F.cross_entropy(
+                fine_logits.float(),
+                gold_fine,
+                ignore_index=IGNORE_INDEX,
+                reduction="mean",
+            )
+
+            if self.fine_loss_weight != 0.0:
+                total_loss = total_loss + self.fine_loss_weight * fine_loss
+                total_weight += abs(self.fine_loss_weight)
+
+            safe_fine = gold_fine.masked_fill(
+                gold_fine.eq(IGNORE_INDEX),
+                self.pad_token_id,
+            )
+
+            fine_emb = self.embed_input_ids(safe_fine).unsqueeze(1)
+
+            attention_after_fine = torch.cat([attention_after_coarse, one], dim=1)
+
+            out_after_fine = self._call_base(
+                inputs_embeds=fine_emb,
+                attention_mask=attention_after_fine,
+                past_key_values=past_after_coarse,
+                use_cache=True,
+            )
+
+            # Keep Cache/DynamicCache object.
+            past = out_after_fine.past_key_values
+
+            coarse_logits = out_after_fine.logits[:, -1, :]
+            cur_attention = attention_after_fine
+
+        if total_weight == 0.0:
+            total_loss = total_loss + outputs.logits.sum() * 0.0
+
+        if fine_logits_for_return:
+            logits = torch.cat(fine_logits_for_return, dim=1)
         else:
-            vocab_size = self._get_embedding_weight().size(0)
-            logits = input_ids.new_zeros(
-                (input_ids.size(0), 0, vocab_size),
-                dtype=self._get_embedding_weight().dtype,
-            )
+            logits = outputs.logits[:, -1:, :]
 
         return CausalLMOutputWithPast(
-            loss=loss,
+            loss=total_loss,
             logits=logits,
             past_key_values=None,
-            hidden_states=None,
-            attentions=None,
+        )
+
+    def _forward_recompute(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        fine_labels: torch.Tensor,
+        coarse_labels: torch.Tensor,
+    ):
+        """
+        Correct but slower no-cache fallback.
+
+        This exists only for compatibility with scripts that pass
+        use_train_cache=False. For speed, use_train_cache=True is recommended.
+        """
+        device = _model_device(self.base_model)
+        input_ids = input_ids.to(device)
+
+        if attention_mask is None:
+            attention_mask = input_ids.ne(self.pad_token_id).long()
+
+        attention_mask = attention_mask.to(device)
+        fine_labels = fine_labels.to(device)
+        coarse_labels = coarse_labels.to(device)
+
+        seq_embeds = self.embed_input_ids(input_ids)
+        cur_attention = attention_mask
+
+        outputs = self._call_base(
+            inputs_embeds=seq_embeds,
+            attention_mask=cur_attention,
+            use_cache=False,
+        )
+
+        coarse_logits = _last_non_pad_logits(outputs.logits, cur_attention)
+
+        total_loss = coarse_logits.new_zeros(())
+        total_weight = 0.0
+        fine_logits_for_return = []
+        code_len = fine_labels.size(1)
+
+        for pos in range(code_len):
+            gold_coarse = coarse_labels[:, pos]
+            gold_fine = fine_labels[:, pos]
+
+            active = gold_fine.ne(IGNORE_INDEX) & gold_coarse.ne(IGNORE_INDEX)
+            if not active.any():
+                break
+
+            coarse_emb, candidate_logits, _candidate_ids, code_pos = self._soft_coarse_embedding(
+                coarse_logits=coarse_logits,
+                pos=pos,
+            )
+
+            coarse_loss = self._coarse_ce(
+                candidate_logits=candidate_logits,
+                code_pos=code_pos,
+                labels=gold_coarse,
+            )
+
+            coarse_w = self.coarse_loss_weight + self.coarse_align_weight
+
+            if coarse_w != 0.0:
+                total_loss = total_loss + coarse_w * coarse_loss
+                total_weight += abs(coarse_w)
+
+            one = torch.ones(
+                (input_ids.size(0), 1),
+                dtype=cur_attention.dtype,
+                device=cur_attention.device,
+            )
+
+            seq_embeds = torch.cat([seq_embeds, coarse_emb.unsqueeze(1)], dim=1)
+            cur_attention = torch.cat([cur_attention, one], dim=1)
+
+            out_after_coarse = self._call_base(
+                inputs_embeds=seq_embeds,
+                attention_mask=cur_attention,
+                use_cache=False,
+            )
+
+            fine_logits = out_after_coarse.logits[:, -1, :]
+            fine_logits_for_return.append(fine_logits.unsqueeze(1))
+
+            fine_loss = F.cross_entropy(
+                fine_logits.float(),
+                gold_fine,
+                ignore_index=IGNORE_INDEX,
+                reduction="mean",
+            )
+
+            if self.fine_loss_weight != 0.0:
+                total_loss = total_loss + self.fine_loss_weight * fine_loss
+                total_weight += abs(self.fine_loss_weight)
+
+            safe_fine = gold_fine.masked_fill(
+                gold_fine.eq(IGNORE_INDEX),
+                self.pad_token_id,
+            )
+
+            fine_emb = self.embed_input_ids(safe_fine).unsqueeze(1)
+
+            seq_embeds = torch.cat([seq_embeds, fine_emb], dim=1)
+            cur_attention = torch.cat([cur_attention, one], dim=1)
+
+            if pos + 1 < code_len:
+                out_after_fine = self._call_base(
+                    inputs_embeds=seq_embeds,
+                    attention_mask=cur_attention,
+                    use_cache=False,
+                )
+
+                coarse_logits = out_after_fine.logits[:, -1, :]
+
+        if total_weight == 0.0:
+            total_loss = total_loss + outputs.logits.sum() * 0.0
+
+        if fine_logits_for_return:
+            logits = torch.cat(fine_logits_for_return, dim=1)
+        else:
+            logits = outputs.logits[:, -1:, :]
+
+        return CausalLMOutputWithPast(
+            loss=total_loss,
+            logits=logits,
+            past_key_values=None,
         )

@@ -31,7 +31,7 @@ def patch_transformers_peft_detection_for_latent_wrapper():
     model passes `_is_peft_model`.
 
     Our top-level model is InterleavedLatentQwen, while the real PeftModel is
-    stored inside `model.base_model`.  The default Trainer check can therefore
+    stored inside `model.base_model`. The default Trainer check can therefore
     incorrectly treat it as a purely quantized model.
 
     This patch makes Trainer accept wrappers that contain a PeftModel submodule.
@@ -44,6 +44,7 @@ def patch_transformers_peft_detection_for_latent_wrapper():
 
         try:
             from peft import PeftMixedModel
+
             peft_types = (PeftModel, PeftMixedModel)
         except Exception:
             peft_types = (PeftModel,)
@@ -73,20 +74,115 @@ def patch_transformers_peft_detection_for_latent_wrapper():
 
         trainer_mod._is_peft_model = _is_peft_model_or_contains_peft
         trainer_utils_mod._is_peft_model = _is_peft_model_or_contains_peft
-
     except Exception as e:
         print("[warning] failed to patch Trainer PEFT detection:", repr(e))
 
 
+class HoloRecTrainer(transformers.Trainer):
+    """
+    Fix for HoloRec-Qwen eval_loss missing.
+
+    Why this is needed:
+    - The batch uses fine_labels/coarse_labels instead of the standard labels.
+    - Some transformers versions do not treat these fields as labels during eval.
+    - Then evaluation returns only eval_runtime / speed metrics.
+    - load_best_model_at_end=True then looks for eval_loss and crashes.
+
+    This trainer explicitly computes eval loss from model(**inputs) when the
+    HoloRec label fields exist.
+    """
+
+    holo_label_names = ["fine_labels", "coarse_labels"]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.label_names = list(self.holo_label_names)
+
+    def prediction_step(
+        self,
+        model,
+        inputs,
+        prediction_loss_only,
+        ignore_keys=None,
+    ):
+        has_holorec_labels = all(name in inputs for name in self.holo_label_names)
+
+        if not has_holorec_labels:
+            return super().prediction_step(
+                model=model,
+                inputs=inputs,
+                prediction_loss_only=prediction_loss_only,
+                ignore_keys=ignore_keys,
+            )
+
+        inputs = self._prepare_inputs(inputs)
+
+        with torch.no_grad():
+            with self.compute_loss_context_manager():
+                loss, outputs = self.compute_loss(
+                    model,
+                    inputs,
+                    return_outputs=True,
+                )
+
+            if loss is None:
+                raise ValueError(
+                    "Model did not return loss during evaluation. "
+                    "Please check InterleavedLatentQwen.forward()."
+                )
+
+            loss = loss.mean().detach()
+
+        # We only need eval_loss for checkpoint selection.
+        # Returning logits here can be very memory-heavy for [B, L, V].
+        return loss, None, None
+
+    def _determine_best_metric(self, metrics=None, trial=None, *args, **kwargs):
+        """
+        Compatibility guard.
+
+        Normal case: eval_loss exists and the parent Trainer handles best model.
+        Guard case: if a future code path still produces no eval_loss, do not
+        crash checkpoint saving; just skip best-model update for that eval.
+        """
+        if metrics is None:
+            metrics = kwargs.get("metrics", None)
+        if metrics is None and len(args) > 0:
+            metrics = args[0]
+
+        if isinstance(metrics, dict):
+            metric_for_best_model = getattr(self.args, "metric_for_best_model", None)
+            if metric_for_best_model is None:
+                metric_for_best_model = "eval_loss"
+
+            metric_to_check = metric_for_best_model
+            if not metric_to_check.startswith("eval_"):
+                metric_to_check = f"eval_{metric_to_check}"
+
+            if metric_to_check not in metrics:
+                print(
+                    "[warning] metric_for_best_model="
+                    f"{metric_to_check!r} not found in eval metrics. "
+                    f"Available metrics: {list(metrics.keys())}. "
+                    "Skip best-model update for this checkpoint."
+                )
+                return False
+
+        try:
+            return super()._determine_best_metric(
+                metrics=metrics,
+                trial=trial,
+            )
+        except TypeError:
+            return super()._determine_best_metric(metrics, trial)
+
+
 def _flatten_tokenizer_ids(encoded):
     ids = encoded.get("input_ids", encoded)
-
     if isinstance(ids, torch.Tensor):
         ids = ids.tolist()
-
     if len(ids) > 0 and isinstance(ids[0], list):
         ids = ids[0]
-
     return [int(x) for x in ids]
 
 
@@ -96,21 +192,16 @@ def token_to_id(tokenizer, token):
     if token_id is None:
         encoded = tokenizer(token, add_special_tokens=False)
         ids = _flatten_tokenizer_ids(encoded)
-
         if len(ids) == 1:
             return int(ids[0])
-
         raise ValueError(f"Token {token!r} is not a single token: {ids}")
 
     unk_id = getattr(tokenizer, "unk_token_id", None)
-
     if unk_id is not None and int(token_id) == int(unk_id):
         encoded = tokenizer(token, add_special_tokens=False)
         ids = _flatten_tokenizer_ids(encoded)
-
         if len(ids) == 1:
             return int(ids[0])
-
         raise ValueError(f"Token {token!r} maps to unk or multiple ids: {ids}")
 
     return int(token_id)
@@ -122,13 +213,15 @@ def build_coarse_position_token_ids_from_dataset(dataset, tokenizer):
 
     Returns:
         List[List[int]]
-        coarse_position_token_ids[pos] contains all allowed coarse token ids
-        at latent coarse position `pos`.
+
+    coarse_position_token_ids[pos] contains all allowed coarse token ids at
+    latent coarse position `pos`.
     """
     if not hasattr(dataset, "coarse_indices") or dataset.coarse_indices is None:
         raise ValueError(
             "Dataset has no coarse_indices. "
-            "Please pass --coarse_index_file, for example --coarse_index_file .tw8.json"
+            "Please pass --coarse_index_file, for example "
+            "--coarse_index_file .tw8.json"
         )
 
     pos_to_ids = {}
@@ -142,11 +235,7 @@ def build_coarse_position_token_ids_from_dataset(dataset, tokenizer):
         raise ValueError("coarse position token ids are empty.")
 
     max_pos = max(pos_to_ids.keys())
-
-    return [
-        sorted(list(pos_to_ids.get(i, set())))
-        for i in range(max_pos + 1)
-    ]
+    return [sorted(list(pos_to_ids.get(i, set()))) for i in range(max_pos + 1)]
 
 
 def prepare_kbit_model_for_latent_cache(model):
@@ -186,9 +275,11 @@ def build_training_args(args, ddp: bool):
     Important:
     - gradient_checkpointing=False because latent wrapper repeatedly calls model.
     - remove_unused_columns=False because Trainer must keep fine_labels/coarse_labels.
+    - label_names tells Trainer that fine_labels/coarse_labels are label fields.
+    - prediction_loss_only=True avoids gathering huge [B, L, V] logits in eval.
     """
-    report_to = []
 
+    report_to = []
     if getattr(args, "report_to", "wandb") and args.report_to.lower() != "none":
         report_to = [x.strip() for x in args.report_to.split(",") if x.strip()]
 
@@ -214,10 +305,14 @@ def build_training_args(args, ddp: bool):
         output_dir=args.output_dir,
         save_total_limit=args.save_total_limit,
         load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
         deepspeed=args.deepspeed,
         ddp_find_unused_parameters=False if ddp else None,
         eval_delay=1 if args.save_and_eval_strategy == "epoch" else 2000,
         remove_unused_columns=False,
+        label_names=["fine_labels", "coarse_labels"],
+        prediction_loss_only=True,
     )
 
     sig = inspect.signature(transformers.TrainingArguments.__init__).parameters
@@ -226,6 +321,9 @@ def build_training_args(args, ddp: bool):
         ta_kwargs["evaluation_strategy"] = args.save_and_eval_strategy
     else:
         ta_kwargs["eval_strategy"] = args.save_and_eval_strategy
+
+    # Keep compatibility with older transformers versions.
+    ta_kwargs = {k: v for k, v in ta_kwargs.items() if k in sig}
 
     return transformers.TrainingArguments(**ta_kwargs)
 
@@ -252,7 +350,6 @@ def make_quant_config(args, compute_dtype):
 def split_arg_list(value):
     if value is None:
         return []
-
     return [x.strip() for x in value.split(",") if x.strip()]
 
 
@@ -271,7 +368,6 @@ def expose_peft_metadata_to_wrapper(wrapper_model, peft_model):
         wrapper_model.active_adapters = peft_model.active_adapters
 
     wrapper_model._hf_peft_config_loaded = True
-
     return wrapper_model
 
 
@@ -289,7 +385,6 @@ def train(args):
     device_map = {"": local_rank} if ddp else "auto"
 
     compute_dtype = torch.float32
-
     if args.bf16:
         compute_dtype = torch.bfloat16
     elif args.fp16:
@@ -310,7 +405,8 @@ def train(args):
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
+
+    tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
 
     train_data, valid_data = load_datasets(args)
 
@@ -368,7 +464,6 @@ def train(args):
         base_model.config.use_cache = True
 
     lora_targets = split_arg_list(args.lora_target_modules)
-
     if len(lora_targets) == 0:
         lora_targets = [
             "qkv_proj",
@@ -382,11 +477,10 @@ def train(args):
         ]
 
     modules_to_save = split_arg_list(args.lora_modules_to_save)
-
     if len(modules_to_save) == 0:
         # Needed because new fine/coarse code tokens are added to tokenizer.
-        # Without this, resized embeddings / lm_head may stay frozen and may not
-        # be saved into the LoRA checkpoint.
+        # Without this, resized embeddings / lm_head may stay frozen and may
+        # not be saved into the LoRA checkpoint.
         modules_to_save = ["embed_tokens", "lm_head"]
 
     lora_config = LoraConfig(
@@ -412,7 +506,6 @@ def train(args):
         if os.path.exists(checkpoint_name):
             if local_rank == 0:
                 print(f"Restarting from {checkpoint_name}")
-
             adapters_weights = torch.load(checkpoint_name, map_location="cpu")
             set_peft_model_state_dict(peft_model, adapters_weights)
         else:
@@ -456,7 +549,6 @@ def train(args):
         model.config.use_cache = True
 
     model.gradient_checkpointing_disable()
-
     model = expose_peft_metadata_to_wrapper(model, peft_model)
 
     # Important: call this before constructing Trainer on every DDP rank.
@@ -464,7 +556,7 @@ def train(args):
 
     training_args = build_training_args(args, ddp)
 
-    trainer = transformers.Trainer(
+    trainer = HoloRecTrainer(
         model=model,
         train_dataset=train_data,
         eval_dataset=valid_data,
@@ -487,7 +579,6 @@ def train(args):
 
 def add_arg_if_absent(parser, *flags, **kwargs):
     existing = set()
-
     for action in parser._actions:
         existing.update(action.option_strings)
 
@@ -495,7 +586,6 @@ def add_arg_if_absent(parser, *flags, **kwargs):
         return parser
 
     parser.add_argument(*flags, **kwargs)
-
     return parser
 
 
@@ -512,77 +602,66 @@ if __name__ == "__main__":
         type=str,
         default=".tw8.json",
     )
-
     add_arg_if_absent(
         parser,
         "--coarse_loss_weight",
         type=float,
         default=1.0,
     )
-
     add_arg_if_absent(
         parser,
         "--fine_loss_weight",
         type=float,
         default=1.0,
     )
-
     add_arg_if_absent(
         parser,
         "--coarse_align_weight",
         type=float,
         default=2.0,
     )
-
     add_arg_if_absent(
         parser,
         "--temperature",
         type=float,
         default=1.0,
     )
-
     add_arg_if_absent(
         parser,
         "--load_in_8bit",
         action="store_true",
         default=True,
     )
-
     add_arg_if_absent(
         parser,
         "--no_load_in_8bit",
         action="store_false",
         dest="load_in_8bit",
     )
-
     add_arg_if_absent(
         parser,
         "--load_in_4bit",
         action="store_true",
         default=False,
     )
-
     add_arg_if_absent(
         parser,
         "--attn_implementation",
         type=str,
         default="flash_attention_2",
     )
-
     add_arg_if_absent(
         parser,
         "--report_to",
         type=str,
         default="wandb",
     )
-
     add_arg_if_absent(
         parser,
         "--save_total_limit",
         type=int,
         default=8,
     )
-
     add_arg_if_absent(
         parser,
         "--no_train_cache",
@@ -594,7 +673,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.load_in_4bit and args.load_in_8bit:
-        raise ValueError("Choose only one of --load_in_4bit and --load_in_8bit.")
+        raise ValueError(
+            "Choose only one of --load_in_4bit and --load_in_8bit. "
+            "If you want 4-bit, pass: --load_in_4bit --no_load_in_8bit"
+        )
 
     if args.tasks.lower() != "seqrec":
         raise ValueError(

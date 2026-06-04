@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-from peft import PeftModel
+from peft import PeftModel, LoraConfig, TaskType, get_peft_model
 
 from utils import *
 from collator import TestCollator
@@ -18,10 +18,479 @@ from prompt import all_prompt
 from evaluate import get_topk_results, get_metrics_results
 from generation_trie import Trie, build_trie_from_token_sequences
 
+try:
+    from safetensors.torch import load_file as safe_load_file
+except Exception:
+    safe_load_file = None
+
+
+def _rank0_print(*msg):
+    if int(os.environ.get("LOCAL_RANK") or 0) == 0:
+        print(*msg)
+
+
+def _split_arg_list(value):
+    if value is None:
+        return []
+
+    if isinstance(value, (list, tuple, set)):
+        return [str(x).strip() for x in value if str(x).strip()]
+
+    value = str(value).strip()
+
+    if not value:
+        return []
+
+    return [x.strip() for x in value.split(",") if x.strip()]
+
+
+def _has_tokenizer_files(path):
+    if not path or not os.path.isdir(path):
+        return False
+
+    names = [
+        "tokenizer_config.json",
+        "tokenizer.json",
+        "vocab.json",
+        "merges.txt",
+        "special_tokens_map.json",
+    ]
+
+    return any(os.path.exists(os.path.join(path, x)) for x in names)
+
+
+def _find_weight_files(ckpt_path):
+    """
+    支持以下 checkpoint 结构：
+
+    1. 标准 Trainer / HF checkpoint:
+       model.safetensors
+       pytorch_model.bin
+
+    2. sharded checkpoint:
+       model.safetensors.index.json
+       pytorch_model.bin.index.json
+
+    3. PEFT adapter 权重但缺 adapter_config.json:
+       adapter_model.safetensors
+       adapter_model.bin
+
+    4. 直接传入单个 .safetensors / .bin 文件。
+    """
+    if os.path.isfile(ckpt_path):
+        return [ckpt_path]
+
+    if not os.path.isdir(ckpt_path):
+        return []
+
+    index_candidates = [
+        "model.safetensors.index.json",
+        "pytorch_model.bin.index.json",
+        "adapter_model.safetensors.index.json",
+        "adapter_model.bin.index.json",
+    ]
+
+    for index_name in index_candidates:
+        index_path = os.path.join(ckpt_path, index_name)
+
+        if os.path.exists(index_path):
+            with open(index_path, "r", encoding="utf-8") as f:
+                index = json.load(f)
+
+            weight_map = index.get("weight_map", {})
+            files = sorted(set(weight_map.values()))
+
+            return [os.path.join(ckpt_path, x) for x in files]
+
+    single_candidates = [
+        "model.safetensors",
+        "pytorch_model.bin",
+        "adapter_model.safetensors",
+        "adapter_model.bin",
+    ]
+
+    for name in single_candidates:
+        path = os.path.join(ckpt_path, name)
+
+        if os.path.exists(path):
+            return [path]
+
+    return []
+
+
+def _load_state_dict_from_files(weight_files):
+    state_dict = {}
+
+    for weight_file in weight_files:
+        if weight_file.endswith(".safetensors"):
+            if safe_load_file is None:
+                raise ImportError(
+                    "Need safetensors to load .safetensors checkpoint. "
+                    "Please run: pip install safetensors"
+                )
+
+            part = safe_load_file(weight_file, device="cpu")
+
+        else:
+            part = torch.load(weight_file, map_location="cpu")
+
+            if isinstance(part, dict):
+                for key in ["state_dict", "model", "module"]:
+                    if key in part and isinstance(part[key], dict):
+                        part = part[key]
+                        break
+
+        if not isinstance(part, dict):
+            raise ValueError(f"Unsupported checkpoint format: {weight_file}")
+
+        state_dict.update(part)
+
+    return state_dict
+
+
+def _state_dict_has_lora(state_dict):
+    for key in state_dict.keys():
+        if "lora_A" in key or "lora_B" in key:
+            return True
+
+    return False
+
+
+def _infer_lora_targets_from_state_dict(state_dict):
+    targets = set()
+
+    for key in state_dict.keys():
+        if ".lora_A." in key and key.endswith(".weight"):
+            prefix = key.split(".lora_A.")[0]
+            module_name = prefix.split(".")[-1]
+
+            if module_name:
+                targets.add(module_name)
+
+        if ".lora_A.weight" in key:
+            prefix = key.split(".lora_A.weight")[0]
+            module_name = prefix.split(".")[-1]
+
+            if module_name:
+                targets.add(module_name)
+
+    return sorted(targets)
+
+
+def _infer_modules_to_save_from_state_dict(state_dict):
+    modules_to_save = set()
+
+    for key in state_dict.keys():
+        if ".modules_to_save." in key:
+            prefix = key.split(".modules_to_save.")[0]
+            module_name = prefix.split(".")[-1]
+
+            if module_name:
+                modules_to_save.add(module_name)
+
+        if ".modules_to_save.weight" in key:
+            prefix = key.split(".modules_to_save.weight")[0]
+            module_name = prefix.split(".")[-1]
+
+            if module_name:
+                modules_to_save.add(module_name)
+
+    return sorted(modules_to_save)
+
+
+def _infer_lora_r_from_state_dict(state_dict):
+    for key, value in state_dict.items():
+        if ".lora_A." in key and key.endswith(".weight"):
+            if hasattr(value, "shape") and len(value.shape) >= 1:
+                return int(value.shape[0])
+
+        if ".lora_A.weight" in key:
+            if hasattr(value, "shape") and len(value.shape) >= 1:
+                return int(value.shape[0])
+
+    return None
+
+
+def _build_lora_config_for_test(args, raw_state_dict=None):
+    """
+    和 lora_finetune.py 保持一致：
+
+    - 优先使用 utils.py / parse_train_args 中的 LoRA 参数。
+    - 如果命令行参数为空，再从 checkpoint 里推断。
+    - 如果仍然推断不到，再使用训练脚本里的 fallback。
+    """
+    inferred_targets = []
+    inferred_modules_to_save = []
+    inferred_r = None
+
+    if raw_state_dict is not None:
+        inferred_targets = _infer_lora_targets_from_state_dict(raw_state_dict)
+        inferred_modules_to_save = _infer_modules_to_save_from_state_dict(raw_state_dict)
+        inferred_r = _infer_lora_r_from_state_dict(raw_state_dict)
+
+    target_modules = _split_arg_list(getattr(args, "lora_target_modules", ""))
+
+    if len(target_modules) == 0:
+        if len(inferred_targets) > 0:
+            target_modules = inferred_targets
+        else:
+            target_modules = [
+                "qkv_proj",
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ]
+
+    modules_to_save = _split_arg_list(getattr(args, "lora_modules_to_save", ""))
+
+    if len(modules_to_save) == 0:
+        if len(inferred_modules_to_save) > 0:
+            modules_to_save = inferred_modules_to_save
+        else:
+            modules_to_save = ["embed_tokens", "lm_head"]
+
+    lora_r = getattr(args, "lora_r", None)
+
+    if lora_r is None:
+        lora_r = inferred_r
+
+    if lora_r is None:
+        lora_r = 16
+
+    lora_alpha = getattr(args, "lora_alpha", 32)
+    lora_dropout = getattr(args, "lora_dropout", 0.05)
+
+    _rank0_print("[ckpt loader] LoRA target_modules:", target_modules)
+    _rank0_print("[ckpt loader] LoRA modules_to_save:", modules_to_save)
+    _rank0_print("[ckpt loader] LoRA r:", lora_r)
+    _rank0_print("[ckpt loader] LoRA alpha:", lora_alpha)
+    _rank0_print("[ckpt loader] LoRA dropout:", lora_dropout)
+
+    return LoraConfig(
+        r=int(lora_r),
+        lora_alpha=int(lora_alpha),
+        target_modules=target_modules,
+        modules_to_save=modules_to_save,
+        lora_dropout=float(lora_dropout),
+        bias="none",
+        inference_mode=True,
+        task_type=TaskType.CAUSAL_LM,
+    )
+
+
+def _insert_default_adapter_name(key):
+    key = key.replace(".lora_A.weight", ".lora_A.default.weight")
+    key = key.replace(".lora_B.weight", ".lora_B.default.weight")
+    key = key.replace(".lora_embedding_A.weight", ".lora_embedding_A.default.weight")
+    key = key.replace(".lora_embedding_B.weight", ".lora_embedding_B.default.weight")
+    key = key.replace(".modules_to_save.weight", ".modules_to_save.default.weight")
+    return key
+
+
+def _remap_key_identity(key):
+    return key
+
+
+def _remap_key_insert_default(key):
+    return _insert_default_adapter_name(key)
+
+
+def _remap_key_strip_module(key):
+    if key.startswith("module."):
+        key = key[len("module."):]
+
+    return key
+
+
+def _remap_key_strip_module_insert_default(key):
+    return _insert_default_adapter_name(_remap_key_strip_module(key))
+
+
+def _remap_key_strip_wrapper_prefix(key):
+    """
+    训练时 Trainer 保存的是 InterleavedLatentQwen wrapper。
+    wrapper 内部的真实 PEFT 模型字段名也是 base_model。
+
+    可能出现：
+      base_model.base_model.model.model.layers...
+    测试时直接构造 PeftModel：
+      base_model.model.model.layers...
+
+    因此去掉最外层 wrapper 的 base_model。
+    """
+    if key.startswith("base_model.base_model."):
+        return key[len("base_model."):]
+
+    return key
+
+
+def _remap_key_strip_wrapper_prefix_insert_default(key):
+    return _insert_default_adapter_name(_remap_key_strip_wrapper_prefix(key))
+
+
+def _remap_key_strip_one_base_model(key):
+    if key.startswith("base_model."):
+        key = key[len("base_model."):]
+
+    return key
+
+
+def _remap_key_strip_one_base_model_insert_default(key):
+    return _insert_default_adapter_name(_remap_key_strip_one_base_model(key))
+
+
+def _remap_key_strip_two_base_model(key):
+    for _ in range(2):
+        if key.startswith("base_model."):
+            key = key[len("base_model."):]
+
+    return key
+
+
+def _remap_key_strip_two_base_model_insert_default(key):
+    return _insert_default_adapter_name(_remap_key_strip_two_base_model(key))
+
+
+def _remap_key_strip_module_then_wrapper_prefix(key):
+    key = _remap_key_strip_module(key)
+    key = _remap_key_strip_wrapper_prefix(key)
+    return key
+
+
+def _remap_key_strip_module_then_wrapper_prefix_insert_default(key):
+    return _insert_default_adapter_name(_remap_key_strip_module_then_wrapper_prefix(key))
+
+
+def _remap_key_strip_module_then_one_base_model(key):
+    key = _remap_key_strip_module(key)
+    key = _remap_key_strip_one_base_model(key)
+    return key
+
+
+def _remap_key_strip_module_then_one_base_model_insert_default(key):
+    return _insert_default_adapter_name(_remap_key_strip_module_then_one_base_model(key))
+
+
+def _remap_key_add_peft_prefix(key):
+    if key.startswith("module."):
+        key = key[len("module."):]
+
+    if key.startswith("base_model."):
+        return key
+
+    return "base_model.model." + key
+
+
+def _remap_key_add_peft_prefix_insert_default(key):
+    return _insert_default_adapter_name(_remap_key_add_peft_prefix(key))
+
+
+def _load_best_matched_state_dict(model, raw_state_dict):
+    """
+    Trainer checkpoint / wrapper checkpoint / PEFT checkpoint 的 key 前缀可能不同。
+    这里尝试多种安全映射，只加载 shape 完全一致的 tensor。
+    """
+    model_state = model.state_dict()
+
+    remappers = [
+        ("identity", _remap_key_identity),
+        ("insert_default", _remap_key_insert_default),
+        ("strip_module", _remap_key_strip_module),
+        ("strip_module_insert_default", _remap_key_strip_module_insert_default),
+        ("strip_wrapper_prefix", _remap_key_strip_wrapper_prefix),
+        ("strip_wrapper_prefix_insert_default", _remap_key_strip_wrapper_prefix_insert_default),
+        ("strip_one_base_model", _remap_key_strip_one_base_model),
+        ("strip_one_base_model_insert_default", _remap_key_strip_one_base_model_insert_default),
+        ("strip_two_base_model", _remap_key_strip_two_base_model),
+        ("strip_two_base_model_insert_default", _remap_key_strip_two_base_model_insert_default),
+        ("strip_module_then_wrapper_prefix", _remap_key_strip_module_then_wrapper_prefix),
+        (
+            "strip_module_then_wrapper_prefix_insert_default",
+            _remap_key_strip_module_then_wrapper_prefix_insert_default,
+        ),
+        ("strip_module_then_one_base_model", _remap_key_strip_module_then_one_base_model),
+        (
+            "strip_module_then_one_base_model_insert_default",
+            _remap_key_strip_module_then_one_base_model_insert_default,
+        ),
+        ("add_peft_prefix", _remap_key_add_peft_prefix),
+        ("add_peft_prefix_insert_default", _remap_key_add_peft_prefix_insert_default),
+    ]
+
+    best_name = None
+    best_matched = None
+    best_count = -1
+
+    for name, remap_fn in remappers:
+        matched = {}
+
+        for old_key, tensor in raw_state_dict.items():
+            new_key = remap_fn(old_key)
+
+            if new_key not in model_state:
+                continue
+
+            if tuple(tensor.shape) != tuple(model_state[new_key].shape):
+                continue
+
+            matched[new_key] = tensor
+
+        if len(matched) > best_count:
+            best_count = len(matched)
+            best_name = name
+            best_matched = matched
+
+    if best_matched is None or len(best_matched) == 0:
+        sample_ckpt_keys = list(raw_state_dict.keys())[:30]
+        sample_model_keys = list(model_state.keys())[:30]
+
+        raise RuntimeError(
+            "No checkpoint weights matched current model.\n"
+            f"Sample checkpoint keys: {sample_ckpt_keys}\n"
+            f"Sample model keys: {sample_model_keys}\n"
+            "Please check --base_model, tokenizer, and LoRA hyperparameters."
+        )
+
+    incompatible = model.load_state_dict(best_matched, strict=False)
+
+    _rank0_print(
+        f"[ckpt loader] loaded {len(best_matched)}/{len(raw_state_dict)} tensors "
+        f"with key remap: {best_name}"
+    )
+    _rank0_print(
+        f"[ckpt loader] missing keys: {len(incompatible.missing_keys)}, "
+        f"unexpected keys: {len(incompatible.unexpected_keys)}"
+    )
+
+    if int(os.environ.get("LOCAL_RANK") or 0) == 0:
+        if len(incompatible.missing_keys) > 0:
+            print("[ckpt loader] first missing keys:", incompatible.missing_keys[:10])
+
+        if len(incompatible.unexpected_keys) > 0:
+            print("[ckpt loader] first unexpected keys:", incompatible.unexpected_keys[:10])
+
+
+def _get_compute_dtype(args):
+    if getattr(args, "use_bf16", False) or getattr(args, "bf16", False):
+        return torch.bfloat16
+
+    if getattr(args, "use_fp16", False) or getattr(args, "fp16", False):
+        return torch.float16
+
+    return torch.bfloat16
+
 
 def build_model_and_tokenizer(args, device_map):
+    ckpt_path = args.ckpt_path
+
+    tokenizer_path = ckpt_path if _has_tokenizer_files(ckpt_path) else args.base_model
+
     tokenizer = AutoTokenizer.from_pretrained(
-        args.ckpt_path,
+        tokenizer_path,
         trust_remote_code=True,
         use_fast=True,
     )
@@ -30,14 +499,13 @@ def build_model_and_tokenizer(args, device_map):
         tokenizer.pad_token = tokenizer.eos_token
 
     tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
+
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
     tokenizer.padding_side = "left"
 
-    if getattr(args, "use_bf16", False):
-        dtype = torch.bfloat16
-    elif getattr(args, "use_fp16", False):
-        dtype = torch.float16
-    else:
-        dtype = torch.bfloat16
+    dtype = _get_compute_dtype(args)
 
     model_kwargs = dict(
         device_map=device_map,
@@ -49,7 +517,23 @@ def build_model_and_tokenizer(args, device_map):
     if getattr(args, "attn_implementation", None):
         model_kwargs["attn_implementation"] = args.attn_implementation
 
-    if args.lora:
+    if getattr(args, "load_in_8bit", False):
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_8bit=True,
+            llm_int8_threshold=6.0,
+            llm_int8_has_fp16_weight=False,
+        )
+
+    adapter_config_path = os.path.join(ckpt_path, "adapter_config.json")
+    has_adapter_config = os.path.exists(adapter_config_path)
+
+    # Case 1:
+    # 标准 PEFT adapter checkpoint:
+    #   adapter_config.json
+    #   adapter_model.safetensors / adapter_model.bin
+    if getattr(args, "lora", False) and has_adapter_config:
+        _rank0_print("[ckpt loader] loading standard PEFT adapter checkpoint")
+
         base = AutoModelForCausalLM.from_pretrained(
             args.base_model,
             **model_kwargs,
@@ -58,24 +542,71 @@ def build_model_and_tokenizer(args, device_map):
 
         model = PeftModel.from_pretrained(
             base,
-            args.ckpt_path,
+            ckpt_path,
             device_map=device_map,
             torch_dtype=dtype,
         )
+
     else:
-        if getattr(args, "load_in_8bit", False):
-            model_kwargs["quantization_config"] = BitsAndBytesConfig(
-                load_in_8bit=True,
-                llm_int8_threshold=6.0,
-                llm_int8_has_fp16_weight=False,
+        weight_files = _find_weight_files(ckpt_path)
+
+        # Case 2:
+        # Trainer / wrapper checkpoint:
+        #   model.safetensors
+        #   trainer_state.json
+        #   optimizer.pt / scheduler.pt
+        #   但没有 adapter_config.json
+        if len(weight_files) > 0:
+            _rank0_print("[ckpt loader] loading raw checkpoint weights:")
+            for wf in weight_files:
+                _rank0_print("  -", wf)
+
+            raw_state_dict = _load_state_dict_from_files(weight_files)
+            has_lora_weights = _state_dict_has_lora(raw_state_dict)
+
+            base = AutoModelForCausalLM.from_pretrained(
+                args.base_model,
+                **model_kwargs,
             )
+            base.resize_token_embeddings(len(tokenizer))
 
-        model = AutoModelForCausalLM.from_pretrained(
-            args.ckpt_path,
-            **model_kwargs,
-        )
+            if getattr(args, "lora", False) or has_lora_weights:
+                if has_lora_weights:
+                    _rank0_print("[ckpt loader] LoRA weights detected in raw checkpoint")
+                else:
+                    _rank0_print("[ckpt loader] --lora enabled, but no LoRA keys detected")
 
-    # This fast inference path does not need KV cache.
+                lora_config = _build_lora_config_for_test(
+                    args=args,
+                    raw_state_dict=raw_state_dict,
+                )
+                model = get_peft_model(base, lora_config)
+
+            else:
+                _rank0_print("[ckpt loader] no LoRA weights detected; loading as full model state_dict")
+                model = base
+
+            _load_best_matched_state_dict(model, raw_state_dict)
+
+            del raw_state_dict
+            torch.cuda.empty_cache()
+
+        # Case 3:
+        # 普通完整 HF model directory。
+        else:
+            _rank0_print("[ckpt loader] no raw weight file found; fallback to AutoModelForCausalLM.from_pretrained")
+
+            model_source = ckpt_path
+
+            if not os.path.exists(os.path.join(ckpt_path, "config.json")):
+                model_source = args.base_model
+
+            model = AutoModelForCausalLM.from_pretrained(
+                model_source,
+                **model_kwargs,
+            )
+            model.resize_token_embeddings(len(tokenizer))
+
     if hasattr(model.config, "use_cache"):
         model.config.use_cache = False
 
@@ -88,9 +619,11 @@ def gather_object_list(local_obj, world_size):
     dist.all_gather_object(gathered, local_obj)
 
     merged = []
+
     for part in gathered:
         if part is None:
             continue
+
         if isinstance(part, list):
             merged.extend(part)
         else:
@@ -102,6 +635,7 @@ def gather_object_list(local_obj, world_size):
 def normalize_code_text(x):
     if x is None:
         return None
+
     return str(x).strip().replace(" ", "")
 
 
@@ -109,40 +643,26 @@ def code_tokens_to_text(tokens: List[str]) -> str:
     return normalize_code_text("".join(tokens))
 
 
-def _flatten_tokenizer_ids(encoded):
-    ids = encoded.get("input_ids", encoded)
-
-    if isinstance(ids, torch.Tensor):
-        ids = ids.tolist()
-
-    if len(ids) > 0 and isinstance(ids[0], list):
-        ids = ids[0]
-
-    return [int(x) for x in ids]
-
-
 def token_to_id(tokenizer, token: str) -> int:
     token_id = tokenizer.convert_tokens_to_ids(token)
 
     if token_id is None:
-        encoded = tokenizer(token, add_special_tokens=False)
-        ids = _flatten_tokenizer_ids(encoded)
+        encoded = tokenizer(token, add_special_tokens=False).get("input_ids", [])
 
-        if len(ids) == 1:
-            return int(ids[0])
+        if len(encoded) == 1:
+            return int(encoded[0])
 
-        raise ValueError(f"Token {token!r} is not a single tokenizer id: {ids}")
+        raise ValueError(f"Token {token!r} is not a single tokenizer id: {encoded}")
 
     unk_id = getattr(tokenizer, "unk_token_id", None)
 
-    if unk_id is not None and int(token_id) == int(unk_id):
-        encoded = tokenizer(token, add_special_tokens=False)
-        ids = _flatten_tokenizer_ids(encoded)
+    if unk_id is not None and token_id == unk_id:
+        encoded = tokenizer(token, add_special_tokens=False).get("input_ids", [])
 
-        if len(ids) == 1:
-            return int(ids[0])
+        if len(encoded) == 1:
+            return int(encoded[0])
 
-        raise ValueError(f"Token {token!r} is mapped to unk or multiple ids: {ids}")
+        raise ValueError(f"Token {token!r} is mapped to unk or multiple ids: {encoded}")
 
     return int(token_id)
 
@@ -175,7 +695,7 @@ def build_fine_all_items(test_data) -> set:
 def build_coarse_position_token_ids(test_data, tokenizer) -> List[List[int]]:
     if not hasattr(test_data, "coarse_indices") or test_data.coarse_indices is None:
         raise ValueError(
-            "Latent inference requires --coarse_index_file, for example .tw8.json"
+            "Latent interleaved inference requires --coarse_index_file, for example .tw8.json"
         )
 
     pos_to_ids = {}
@@ -196,20 +716,22 @@ def build_coarse_position_token_ids(test_data, tokenizer) -> List[List[int]]:
 def _to_list(x):
     if x is None:
         return []
+
     if isinstance(x, (list, tuple, set)):
         return list(x)
+
     return [x]
 
 
 def unwrap_modules_to_save_embedding(module):
     """
-    PEFT modules_to_save may wrap embed_tokens or lm_head.
-    Return the real module when possible.
+    PEFT 的 modules_to_save 可能会包住 embed_tokens。
+    这里取出真正带 .weight 的 embedding module。
     """
     if module is None:
-        raise AttributeError("Module is None.")
+        raise AttributeError("Input embedding module is None.")
 
-    if hasattr(module, "weight") and callable(getattr(module, "forward", None)):
+    if hasattr(module, "weight"):
         return module
 
     modules_to_save = getattr(module, "modules_to_save", None)
@@ -222,11 +744,13 @@ def unwrap_modules_to_save_embedding(module):
 
         if hasattr(module, "active_adapters"):
             active_adapters = getattr(module, "active_adapters")
+
             if callable(active_adapters):
                 try:
                     active_adapters = active_adapters()
                 except TypeError:
                     active_adapters = None
+
             active_names.extend(_to_list(active_adapters))
 
         if hasattr(module, "_active_adapter"):
@@ -240,15 +764,19 @@ def unwrap_modules_to_save_embedding(module):
         for name in active_names:
             if name is None:
                 continue
+
             name = str(name)
+
             if name in seen:
                 continue
+
             seen.add(name)
             clean_names.append(name)
 
         for name in clean_names:
             if name in modules_to_save:
                 candidate = modules_to_save[name]
+
                 if hasattr(candidate, "weight"):
                     return candidate
 
@@ -267,23 +795,25 @@ def unwrap_modules_to_save_embedding(module):
         return unwrap_modules_to_save_embedding(child)
 
     raise AttributeError(
-        "Cannot find real module weight. "
+        "Cannot find real embedding weight from input embeddings. "
         f"Got module type: {type(module).__name__}."
     )
 
 
 def get_model_input_embeddings(model):
     """
-    Compatible with normal HF model and PEFT / LoRA model.
-    Return the real input embedding module.
+    兼容普通 HF model 和 PEFT/Lora model。
+    返回真正的 embedding module。
     """
     if hasattr(model, "get_input_embeddings"):
         emb = model.get_input_embeddings()
+
         if emb is not None:
             return unwrap_modules_to_save_embedding(emb)
 
     if hasattr(model, "base_model") and hasattr(model.base_model, "get_input_embeddings"):
         emb = model.base_model.get_input_embeddings()
+
         if emb is not None:
             return unwrap_modules_to_save_embedding(emb)
 
@@ -293,88 +823,21 @@ def get_model_input_embeddings(model):
     raise ValueError("Cannot locate model input embeddings.")
 
 
-def get_model_output_embeddings(model):
+def model_next_logits_no_cache(model, inputs_embeds, attention_mask):
     """
-    Compatible with normal HF model and PEFT / LoRA model.
-    Return lm_head / output embeddings module.
+    no-cache forward。
+    输入完整 hidden prefix，返回最后一个位置预测下一个 token 的 logits。
     """
-    if hasattr(model, "get_output_embeddings"):
-        lm_head = model.get_output_embeddings()
-        if lm_head is not None:
-            return lm_head
+    outputs = model(
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        use_cache=False,
+        return_dict=True,
+        output_attentions=False,
+        output_hidden_states=False,
+    )
 
-    if hasattr(model, "lm_head"):
-        return model.lm_head
-
-    if hasattr(model, "base_model") and hasattr(model.base_model, "lm_head"):
-        return model.base_model.lm_head
-
-    if hasattr(model, "model") and hasattr(model.model, "lm_head"):
-        return model.model.lm_head
-
-    raise ValueError("Cannot locate model output embeddings / lm_head.")
-
-
-def model_next_logits_and_hidden_no_cache(model, inputs_embeds, attention_mask):
-    """
-    One no-cache forward.
-
-    Returns:
-        next_logits: [B, V]
-        next_hidden: [B, H], hidden state fed into lm_head at the last position.
-
-    This is used by the fast latent formula:
-        hidden -> coarse soft emb
-        hidden + coarse soft emb -> lm_head -> fine logits
-    """
-    lm_head = get_model_output_embeddings(model)
-    captured = {}
-
-    def _pre_hook(module, inputs):
-        if len(inputs) > 0:
-            captured["hidden"] = inputs[0]
-
-    handle = lm_head.register_forward_pre_hook(_pre_hook)
-
-    try:
-        outputs = model(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            use_cache=False,
-            return_dict=True,
-            output_attentions=False,
-            output_hidden_states=False,
-        )
-    finally:
-        handle.remove()
-
-    if "hidden" not in captured:
-        raise RuntimeError(
-            "Failed to capture lm_head input hidden states. "
-            "Please check get_model_output_embeddings()."
-        )
-
-    next_logits = outputs.logits[:, -1, :]
-    next_hidden = captured["hidden"][:, -1, :]
-
-    return next_logits, next_hidden
-
-
-def latent_fused_fine_logits(
-    model,
-    context_hidden,
-    coarse_embeds,
-    coarse_fusion_scale=1.0,
-):
-    """
-    Fast coarse-to-fine scoring:
-
-        fused_hidden = context_hidden + coarse_fusion_scale * coarse_emb
-        fine_logits = lm_head(fused_hidden)
-    """
-    lm_head = get_model_output_embeddings(model)
-    fused_hidden = context_hidden + float(coarse_fusion_scale) * coarse_embeds
-    return lm_head(fused_hidden)
+    return outputs.logits[:, -1, :]
 
 
 def predict_soft_coarse_embedding(
@@ -385,10 +848,18 @@ def predict_soft_coarse_embedding(
     use_coarse_score,
 ):
     """
-    coarse logits -> soft coarse embedding.
+    推理阶段：
+      coarse logits -> soft coarse embedding
 
-    coarse is not decoded as text.
-    coarse is restricted to the current position's coarse codebook.
+    coarse 不解码成文本，不作为显式 token 输出。
+    只在当前 coarse codebook 上做 softmax，然后对 embedding 加权求和。
+
+    next_logits: [B, vocab_size]
+    coarse_token_ids: 当前 coarse 位置允许的 coarse token id 列表
+
+    return:
+      soft_coarse_emb: [B, hidden_size]
+      coarse_score: [B]
     """
     ids = torch.tensor(
         coarse_token_ids,
@@ -397,7 +868,6 @@ def predict_soft_coarse_embedding(
     )
 
     candidate_logits = next_logits.index_select(dim=-1, index=ids)
-
     log_probs = F.log_softmax(candidate_logits.float(), dim=-1)
 
     probs = F.softmax(
@@ -431,23 +901,20 @@ def batch_generate_latent_interleaved_qwen(
     num_beams: int,
     coarse_temperature: float = 0.8,
     use_coarse_score_in_rank: bool = False,
-    coarse_fusion_scale: float = 1.0,
 ):
     """
-    Fast latent inference, matching the fast training formula.
+    简单 no-cache 隐式交错推理。
 
-    Each fine code position:
-        context -> Qwen once -> next logits + hidden
-        next logits -> soft coarse embedding
-        hidden + soft coarse embedding -> lm_head -> fine logits
-        trie-constrained beam selects fine token
-        append selected fine embedding only
+    每个 fine code 位置执行：
+      context
+      -> coarse logits
+      -> soft coarse embedding
+      -> fine logits
+      -> select fine token
+      -> append soft coarse emb + fine emb to context
 
-    Important:
-        - coarse embedding is predicted, not gold.
-        - coarse embedding is not decoded.
-        - coarse embedding is not appended to next-step context.
-        - no second Qwen forward after coarse embedding.
+    输出只 decode fine tokens。
+    coarse tokens 永远不作为文本输出。
     """
     device = inputs["input_ids"].device
     input_ids = inputs["input_ids"]
@@ -456,6 +923,7 @@ def batch_generate_latent_interleaved_qwen(
 
     embedding_module = get_model_input_embeddings(model)
     embedding_weight = embedding_module.weight
+
     prompt_embeds = embedding_module(input_ids)
     hidden_size = embedding_weight.size(-1)
 
@@ -497,7 +965,6 @@ def batch_generate_latent_interleaved_qwen(
 
         for flat_idx, beam in enumerate(flat_beams):
             sample_id = flat_sample_ids[flat_idx]
-
             sample_prompt_embeds = prompt_embeds[sample_id]
             sample_prompt_mask = attention_mask[sample_id]
             extra_embeds = beam["extra_embeds"]
@@ -518,6 +985,7 @@ def batch_generate_latent_interleaved_qwen(
                     [sample_prompt_mask, extra_attention],
                     dim=0,
                 )
+
             else:
                 full_embeds = sample_prompt_embeds
                 full_attention = sample_prompt_mask
@@ -528,14 +996,14 @@ def batch_generate_latent_interleaved_qwen(
         full_inputs_embeds = torch.stack(full_embeds_list, dim=0)
         full_attention_mask = torch.stack(full_attention_list, dim=0)
 
-        # 1. Current context predicts coarse logits and provides context hidden.
-        coarse_logits, context_hidden = model_next_logits_and_hidden_no_cache(
+        # 1. 当前 context 预测隐式 coarse。
+        coarse_logits = model_next_logits_no_cache(
             model=model,
             inputs_embeds=full_inputs_embeds,
             attention_mask=full_attention_mask,
         )
 
-        # 2. Coarse logits -> soft coarse embedding.
+        # 2. coarse logits 转为 soft coarse embedding。
         coarse_pos = min(step_idx, len(coarse_position_token_ids) - 1)
         coarse_ids_this_pos = coarse_position_token_ids[coarse_pos]
 
@@ -550,13 +1018,27 @@ def batch_generate_latent_interleaved_qwen(
             use_coarse_score=use_coarse_score_in_rank,
         )
 
-        # 3. Fast coarse-to-fine path:
-        #    hidden + coarse_emb -> lm_head -> fine logits.
-        fine_logits = latent_fused_fine_logits(
+        # 3. context + soft coarse embedding 预测显式 fine token。
+        inputs_after_coarse = torch.cat(
+            [full_inputs_embeds, coarse_embeds.unsqueeze(1)],
+            dim=1,
+        )
+
+        ones = torch.ones(
+            (inputs_after_coarse.size(0), 1),
+            dtype=full_attention_mask.dtype,
+            device=device,
+        )
+
+        attention_after_coarse = torch.cat(
+            [full_attention_mask, ones],
+            dim=1,
+        )
+
+        fine_logits = model_next_logits_no_cache(
             model=model,
-            context_hidden=context_hidden,
-            coarse_embeds=coarse_embeds,
-            coarse_fusion_scale=coarse_fusion_scale,
+            inputs_embeds=inputs_after_coarse,
+            attention_mask=attention_after_coarse,
         )
 
         fine_log_probs = F.log_softmax(fine_logits.float(), dim=-1)
@@ -605,11 +1087,12 @@ def batch_generate_latent_interleaved_qwen(
 
                 fine_emb = embedding_weight[fine_token_id].unsqueeze(0)
 
-                # Fast version appends only selected fine embedding.
-                # Coarse embedding is latent and local to this step.
+                # 下一步 context 追加：
+                # soft coarse embedding + selected fine embedding
                 new_extra_embeds = torch.cat(
                     [
                         beam["extra_embeds"],
+                        coarse_embeds[flat_idx].unsqueeze(0),
                         fine_emb,
                     ],
                     dim=0,
@@ -733,6 +1216,7 @@ def run_vanilla_generate(
                 use_cache=True,
             )
             break
+
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
             num_beams -= 1
@@ -792,10 +1276,10 @@ def test_ddp(args):
         args,
         device_map=device_map,
     )
-
     model.eval()
 
     prompt_ids = parse_prompt_ids(args)
+
     test_data = load_test_dataset(args)
 
     ddp_sampler = DistributedSampler(
@@ -821,14 +1305,14 @@ def test_ddp(args):
         coarse_position_token_ids = build_coarse_position_token_ids(test_data, tokenizer)
 
         if local_rank == 0:
-            print("[fast latent inference] enabled")
-            print("[fast latent inference] fine_code_len:", fine_code_len)
-            print("[fast latent inference] coarse positions:", len(coarse_position_token_ids))
-            print("[fast latent inference] fine trie size:", len(fine_trie))
-            print("[fast latent inference] coarse_fusion_scale:", args.coarse_fusion_scale)
+            print("[latent interleaved no-cache] enabled")
+            print("[latent interleaved no-cache] fine_code_len:", fine_code_len)
+            print("[latent interleaved no-cache] coarse positions:", len(coarse_position_token_ids))
+            print("[latent interleaved no-cache] fine trie size:", len(fine_trie))
+
     else:
         if local_rank == 0:
-            print("[latent inference] disabled, using vanilla generate()")
+            print("[latent interleaved] disabled, using vanilla generate()")
 
     test_loader = DataLoader(
         test_data,
@@ -848,9 +1332,9 @@ def test_ddp(args):
     all_pairs_rank0 = []
     all_txt_lines_rank0 = []
 
-    if getattr(args, "use_bf16", False):
+    if getattr(args, "use_bf16", False) or getattr(args, "bf16", False):
         amp_dtype = torch.bfloat16
-    elif getattr(args, "use_fp16", False):
+    elif getattr(args, "use_fp16", False) or getattr(args, "fp16", False):
         amp_dtype = torch.float16
     else:
         amp_dtype = None
@@ -873,7 +1357,6 @@ def test_ddp(args):
                 inputs = batch[0].to(device)
                 fine_targets = batch[1]
                 coarse_targets = batch[2]
-
                 bs = len(fine_targets)
                 prompt_len = inputs["input_ids"].shape[1]
 
@@ -890,7 +1373,6 @@ def test_ddp(args):
                                 num_beams=args.num_beams,
                                 coarse_temperature=args.interleaved_temperature,
                                 use_coarse_score_in_rank=args.use_coarse_score_in_rank,
-                                coarse_fusion_scale=args.coarse_fusion_scale,
                             )
                     else:
                         decoded, scores = batch_generate_latent_interleaved_qwen(
@@ -903,7 +1385,6 @@ def test_ddp(args):
                             num_beams=args.num_beams,
                             coarse_temperature=args.interleaved_temperature,
                             use_coarse_score_in_rank=args.use_coarse_score_in_rank,
-                            coarse_fusion_scale=args.coarse_fusion_scale,
                         )
                 else:
                     decoded, scores = run_vanilla_generate(
@@ -917,13 +1398,13 @@ def test_ddp(args):
 
                 if local_rank == 0 and step < 3:
                     empty_cnt = sum(
-                        1 for x in decoded if x is None or x.strip() == ""
+                        1 for x in decoded
+                        if x is None or x.strip() == ""
                     )
                     sample0 = repr(decoded[0]) if decoded else None
 
                     print(
-                        f"[debug] empty decoded: {empty_cnt}/{len(decoded)} ; "
-                        f"sample0={sample0}"
+                        f"[debug] empty decoded: {empty_cnt}/{len(decoded)} ; sample0={sample0}"
                     )
 
                 if getattr(args, "eval_coarse_as_correct", False):
@@ -1070,88 +1551,65 @@ def add_interleaved_test_args(parser):
         type=str,
         default=".tw8.json",
     )
-
     parser.add_argument(
         "--interleaved_temperature",
         type=float,
         default=0.8,
     )
-
     parser.add_argument(
         "--interleaved_inference",
         action="store_true",
         default=True,
     )
-
     parser.add_argument(
         "--no_interleaved_inference",
         dest="interleaved_inference",
         action="store_false",
     )
-
     parser.add_argument(
         "--use_coarse_score_in_rank",
         action="store_true",
         default=False,
     )
-
     parser.add_argument(
         "--eval_coarse_as_correct",
         action="store_true",
         default=False,
     )
-
     parser.add_argument(
         "--save_simple_results",
         action="store_true",
         default=False,
     )
-
     parser.add_argument(
         "--max_new_tokens",
         type=int,
         default=10,
     )
-
     parser.add_argument(
         "--use_bf16",
         action="store_true",
         default=True,
     )
-
     parser.add_argument(
         "--use_fp16",
         action="store_true",
         default=False,
     )
-
     parser.add_argument(
         "--load_in_8bit",
         action="store_true",
         default=False,
     )
-
     parser.add_argument(
         "--attn_implementation",
         type=str,
         default="flash_attention_2",
     )
-
     parser.add_argument(
         "--num_workers",
         type=int,
         default=2,
-    )
-
-    parser.add_argument(
-        "--coarse_fusion_scale",
-        type=float,
-        default=1.0,
-        help=(
-            "Fusion scale for fast latent inference: "
-            "fine_logits = lm_head(hidden + scale * coarse_soft_embedding). "
-            "Use the same value as training."
-        ),
     )
 
     return parser
@@ -1159,10 +1617,19 @@ def add_interleaved_test_args(parser):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Fast latent HoloRec-Qwen DDP test"
+        description="Simple latent interleaved HoloRec-Qwen DDP test"
     )
 
     parser = parse_global_args(parser)
+
+    # 复用 utils.py 中训练时的 LoRA 参数，保持和 lora_finetune.py 一致：
+    # --lora_r
+    # --lora_alpha
+    # --lora_dropout
+    # --lora_target_modules
+    # --lora_modules_to_save
+    parser = parse_train_args(parser)
+
     parser = parse_dataset_args(parser)
     parser = parse_test_args(parser)
     parser = add_interleaved_test_args(parser)

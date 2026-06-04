@@ -1,7 +1,7 @@
 import argparse
 import json
 import os
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List
 
 import torch
 import torch.distributed as dist
@@ -28,8 +28,8 @@ def build_model_and_tokenizer(args, device_map):
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
 
+    tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
     tokenizer.padding_side = "left"
 
     if getattr(args, "use_bf16", False):
@@ -55,6 +55,7 @@ def build_model_and_tokenizer(args, device_map):
             **model_kwargs,
         )
         base.resize_token_embeddings(len(tokenizer))
+
         model = PeftModel.from_pretrained(
             base,
             args.ckpt_path,
@@ -68,13 +69,14 @@ def build_model_and_tokenizer(args, device_map):
                 llm_int8_threshold=6.0,
                 llm_int8_has_fp16_weight=False,
             )
+
         model = AutoModelForCausalLM.from_pretrained(
             args.ckpt_path,
             **model_kwargs,
         )
 
     if hasattr(model.config, "use_cache"):
-        model.config.use_cache = True
+        model.config.use_cache = False
 
     model.eval()
     return tokenizer, model
@@ -85,6 +87,7 @@ def gather_object_list(local_obj, world_size):
     dist.all_gather_object(gathered, local_obj)
 
     merged = []
+
     for part in gathered:
         if part is None:
             continue
@@ -116,6 +119,7 @@ def token_to_id(tokenizer, token: str) -> int:
         raise ValueError(f"Token {token!r} is not a single tokenizer id: {encoded}")
 
     unk_id = getattr(tokenizer, "unk_token_id", None)
+
     if unk_id is not None and token_id == unk_id:
         encoded = tokenizer(token, add_special_tokens=False).get("input_ids", [])
         if len(encoded) == 1:
@@ -171,106 +175,124 @@ def build_coarse_position_token_ids(test_data, tokenizer) -> List[List[int]]:
     ]
 
 
+def _to_list(x):
+    if x is None:
+        return []
+    if isinstance(x, (list, tuple, set)):
+        return list(x)
+    return [x]
+
+
+def unwrap_modules_to_save_embedding(module):
+    """
+    PEFT 的 modules_to_save 可能会包住 embed_tokens。
+    这里取出真正带 .weight 的 embedding module。
+    """
+    if module is None:
+        raise AttributeError("Input embedding module is None.")
+
+    if hasattr(module, "weight"):
+        return module
+
+    modules_to_save = getattr(module, "modules_to_save", None)
+
+    if modules_to_save is not None:
+        active_names = []
+
+        if hasattr(module, "active_adapter"):
+            active_names.extend(_to_list(getattr(module, "active_adapter")))
+
+        if hasattr(module, "active_adapters"):
+            active_adapters = getattr(module, "active_adapters")
+            if callable(active_adapters):
+                try:
+                    active_adapters = active_adapters()
+                except TypeError:
+                    active_adapters = None
+            active_names.extend(_to_list(active_adapters))
+
+        if hasattr(module, "_active_adapter"):
+            active_names.extend(_to_list(getattr(module, "_active_adapter")))
+
+        active_names.append("default")
+
+        seen = set()
+        clean_names = []
+
+        for name in active_names:
+            if name is None:
+                continue
+
+            name = str(name)
+
+            if name in seen:
+                continue
+
+            seen.add(name)
+            clean_names.append(name)
+
+        for name in clean_names:
+            if name in modules_to_save:
+                candidate = modules_to_save[name]
+                if hasattr(candidate, "weight"):
+                    return candidate
+
+        for _, candidate in modules_to_save.items():
+            if hasattr(candidate, "weight"):
+                return candidate
+
+    original_module = getattr(module, "original_module", None)
+
+    if original_module is not None and hasattr(original_module, "weight"):
+        return original_module
+
+    child = getattr(module, "module", None)
+
+    if child is not None and child is not module:
+        return unwrap_modules_to_save_embedding(child)
+
+    raise AttributeError(
+        "Cannot find real embedding weight from input embeddings. "
+        f"Got module type: {type(module).__name__}."
+    )
+
+
 def get_model_input_embeddings(model):
+    """
+    兼容普通 HF model 和 PEFT/Lora model。
+    返回真正的 embedding module。
+    """
     if hasattr(model, "get_input_embeddings"):
         emb = model.get_input_embeddings()
         if emb is not None:
-            return emb
+            return unwrap_modules_to_save_embedding(emb)
 
     if hasattr(model, "base_model") and hasattr(model.base_model, "get_input_embeddings"):
         emb = model.base_model.get_input_embeddings()
         if emb is not None:
-            return emb
+            return unwrap_modules_to_save_embedding(emb)
 
     if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
-        return model.model.embed_tokens
+        return unwrap_modules_to_save_embedding(model.model.embed_tokens)
 
     raise ValueError("Cannot locate model input embeddings.")
 
 
-def _as_legacy_cache(past_key_values):
-    if past_key_values is None:
-        return None
-    if hasattr(past_key_values, "to_legacy_cache"):
-        return past_key_values.to_legacy_cache()
-    return past_key_values
-
-
-def _slice_past(past_key_values, index: int):
-    past_key_values = _as_legacy_cache(past_key_values)
-
-    return tuple(
-        tuple(x[index:index + 1].contiguous() for x in layer)
-        for layer in past_key_values
-    )
-
-
-def _select_past(past_key_values, indices: Sequence[int]):
-    past_key_values = _as_legacy_cache(past_key_values)
-
-    if len(indices) == 1:
-        return _slice_past(past_key_values, int(indices[0]))
-
-    device = past_key_values[0][0].device
-    idx = torch.tensor([int(i) for i in indices], dtype=torch.long, device=device)
-
-    return tuple(
-        tuple(x.index_select(0, idx).contiguous() for x in layer)
-        for layer in past_key_values
-    )
-
-
-def _concat_pasts(pasts: Sequence[Tuple[Tuple[torch.Tensor, ...], ...]]):
-    if len(pasts) == 1:
-        return pasts[0]
-
-    layers = []
-
-    for layer_idx in range(len(pasts[0])):
-        parts = []
-        for kv_idx in range(len(pasts[0][layer_idx])):
-            parts.append(
-                torch.cat(
-                    [p[layer_idx][kv_idx] for p in pasts],
-                    dim=0,
-                ).contiguous()
-            )
-        layers.append(tuple(parts))
-
-    return tuple(layers)
-
-
-def _model_forward_cached(
-    model,
-    *,
-    inputs_embeds,
-    attention_mask,
-    past_key_values,
-):
-    out = model(
+def model_next_logits_no_cache(model, inputs_embeds, attention_mask):
+    """
+    no-cache forward。
+    输入完整 hidden prefix，返回最后一个位置预测下一个 token 的 logits。
+    """
+    outputs = model(
         inputs_embeds=inputs_embeds,
         attention_mask=attention_mask,
-        past_key_values=past_key_values,
-        use_cache=True,
+        use_cache=False,
         return_dict=True,
         output_attentions=False,
         output_hidden_states=False,
     )
-    out.past_key_values = _as_legacy_cache(out.past_key_values)
-    return out
 
-
-def _prompt_forward(model, input_ids, attention_mask):
-    out = model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        use_cache=True,
-        return_dict=True,
-        output_attentions=False,
-        output_hidden_states=False,
-    )
-    out.past_key_values = _as_legacy_cache(out.past_key_values)
-    return out
+    return outputs.logits[:, -1, :]
 
 
 def predict_soft_coarse_embedding(
@@ -280,6 +302,23 @@ def predict_soft_coarse_embedding(
     temperature,
     use_coarse_score,
 ):
+    """
+    推理阶段：
+        coarse logits -> soft coarse embedding
+
+    coarse 不解码成文本，不作为显式 token 输出。
+    只在当前 coarse codebook 上做 softmax，然后对 embedding 加权求和。
+
+    next_logits:
+        [B, vocab_size]
+
+    coarse_token_ids:
+        当前 coarse 位置允许的 coarse token id 列表
+
+    return:
+        soft_coarse_emb: [B, hidden_size]
+        coarse_score:    [B]
+    """
     ids = torch.tensor(
         coarse_token_ids,
         dtype=torch.long,
@@ -289,25 +328,31 @@ def predict_soft_coarse_embedding(
     candidate_logits = next_logits.index_select(dim=-1, index=ids)
 
     log_probs = F.log_softmax(candidate_logits.float(), dim=-1)
+
     probs = F.softmax(
         candidate_logits.float() / max(float(temperature), 1e-6),
         dim=-1,
-    ).to(embedding_weight.dtype)
+    ).to(dtype=embedding_weight.dtype)
 
-    emb = probs @ embedding_weight.index_select(dim=0, index=ids).to(probs.dtype)
+    candidate_embeds = embedding_weight.index_select(dim=0, index=ids)
+
+    soft_coarse_emb = probs @ candidate_embeds
 
     if use_coarse_score:
-        score = torch.sum(probs.float() * log_probs, dim=-1)
+        # 这里是 soft distribution 的期望 log-prob。
+        # 默认关闭，不参与 beam 排序。
+        coarse_score = torch.sum(probs.float() * log_probs, dim=-1)
     else:
-        score = torch.zeros(
+        coarse_score = torch.zeros(
             next_logits.size(0),
             dtype=torch.float32,
             device=next_logits.device,
         )
 
-    return emb, score
+    return soft_coarse_emb, coarse_score
 
 
+@torch.no_grad()
 def batch_generate_latent_interleaved_qwen(
     model,
     tokenizer,
@@ -320,40 +365,47 @@ def batch_generate_latent_interleaved_qwen(
     use_coarse_score_in_rank: bool = False,
 ):
     """
-    Fast implicit interleaved inference.
+    简单 no-cache 隐式交错推理。
 
-    Visible output contains fine tokens only.
-    Hidden path for each fine position:
-        previous state -> soft coarse latent embedding -> fine logits -> fine token
+    每个 fine code 位置执行：
+
+        context
+          -> coarse logits
+          -> soft coarse embedding
+          -> fine logits
+          -> select fine token
+          -> append soft coarse emb + fine emb to context
+
+    输出只 decode fine tokens。
+    coarse tokens 永远不作为文本输出。
     """
-
     device = inputs["input_ids"].device
+
     input_ids = inputs["input_ids"]
     attention_mask = inputs["attention_mask"]
+
     batch_size = input_ids.size(0)
 
-    embedding_weight = get_model_input_embeddings(model).weight
+    embedding_module = get_model_input_embeddings(model)
+    embedding_weight = embedding_module.weight
 
-    prompt_out = _prompt_forward(
-        model=model,
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-    )
-
-    prompt_past = prompt_out.past_key_values
-    prompt_next_logits = prompt_out.logits[:, -1, :]
+    prompt_embeds = embedding_module(input_ids)
+    hidden_size = embedding_weight.size(-1)
 
     beams_by_sample: List[List[Dict]] = []
 
-    for b in range(batch_size):
+    for _ in range(batch_size):
         beams_by_sample.append(
             [
                 {
                     "fine_token_ids": [],
                     "score": 0.0,
-                    "past": _slice_past(prompt_past, b),
-                    "attention_mask": attention_mask[b:b + 1].contiguous(),
-                    "next_logits": prompt_next_logits[b:b + 1].contiguous(),
+                    "extra_embeds": torch.empty(
+                        0,
+                        hidden_size,
+                        dtype=prompt_embeds.dtype,
+                        device=device,
+                    ),
                 }
             ]
         )
@@ -373,51 +425,88 @@ def batch_generate_latent_interleaved_qwen(
         if len(flat_beams) == 0:
             break
 
-        next_logits = torch.cat(
-            [b["next_logits"] for b in flat_beams],
-            dim=0,
+        full_embeds_list = []
+        full_attention_list = []
+
+        for flat_idx, beam in enumerate(flat_beams):
+            sample_id = flat_sample_ids[flat_idx]
+
+            sample_prompt_embeds = prompt_embeds[sample_id]
+            sample_prompt_mask = attention_mask[sample_id]
+
+            extra_embeds = beam["extra_embeds"]
+
+            if extra_embeds.size(0) > 0:
+                full_embeds = torch.cat(
+                    [sample_prompt_embeds, extra_embeds],
+                    dim=0,
+                )
+
+                extra_attention = torch.ones(
+                    extra_embeds.size(0),
+                    dtype=sample_prompt_mask.dtype,
+                    device=device,
+                )
+
+                full_attention = torch.cat(
+                    [sample_prompt_mask, extra_attention],
+                    dim=0,
+                )
+            else:
+                full_embeds = sample_prompt_embeds
+                full_attention = sample_prompt_mask
+
+            full_embeds_list.append(full_embeds)
+            full_attention_list.append(full_attention)
+
+        full_inputs_embeds = torch.stack(full_embeds_list, dim=0)
+        full_attention_mask = torch.stack(full_attention_list, dim=0)
+
+        # 1. 当前 context 预测隐式 coarse。
+        coarse_logits = model_next_logits_no_cache(
+            model=model,
+            inputs_embeds=full_inputs_embeds,
+            attention_mask=full_attention_mask,
         )
 
-        batched_past = _concat_pasts(
-            [b["past"] for b in flat_beams],
-        )
-
-        batched_attention = torch.cat(
-            [b["attention_mask"] for b in flat_beams],
-            dim=0,
-        )
-
+        # 2. coarse logits 转为 soft coarse embedding。
         coarse_pos = min(step_idx, len(coarse_position_token_ids) - 1)
         coarse_ids_this_pos = coarse_position_token_ids[coarse_pos]
 
-        coarse_emb, coarse_scores = predict_soft_coarse_embedding(
-            next_logits=next_logits,
+        if len(coarse_ids_this_pos) == 0:
+            raise ValueError(f"Empty coarse codebook at position {coarse_pos}.")
+
+        coarse_embeds, coarse_scores = predict_soft_coarse_embedding(
+            next_logits=coarse_logits,
             embedding_weight=embedding_weight,
             coarse_token_ids=coarse_ids_this_pos,
             temperature=coarse_temperature,
             use_coarse_score=use_coarse_score_in_rank,
         )
 
+        # 3. context + soft coarse embedding 预测显式 fine token。
+        inputs_after_coarse = torch.cat(
+            [full_inputs_embeds, coarse_embeds.unsqueeze(1)],
+            dim=1,
+        )
+
         ones = torch.ones(
-            (len(flat_beams), 1),
-            dtype=batched_attention.dtype,
+            (inputs_after_coarse.size(0), 1),
+            dtype=full_attention_mask.dtype,
             device=device,
         )
 
         attention_after_coarse = torch.cat(
-            [batched_attention, ones],
+            [full_attention_mask, ones],
             dim=1,
         )
 
-        out_after_coarse = _model_forward_cached(
-            model,
-            inputs_embeds=coarse_emb.unsqueeze(1),
+        fine_logits = model_next_logits_no_cache(
+            model=model,
+            inputs_embeds=inputs_after_coarse,
             attention_mask=attention_after_coarse,
-            past_key_values=batched_past,
         )
 
-        past_after_coarse = out_after_coarse.past_key_values
-        fine_logits = out_after_coarse.logits[:, -1, :]
         fine_log_probs = F.log_softmax(fine_logits.float(), dim=-1)
 
         raw_candidates = []
@@ -430,6 +519,7 @@ def batch_generate_latent_interleaved_qwen(
                 trie_cache[prefix_key] = fine_trie.get(fine_prefix)
 
             allowed = trie_cache[prefix_key]
+
             if allowed is None or len(allowed) == 0:
                 continue
 
@@ -440,12 +530,17 @@ def batch_generate_latent_interleaved_qwen(
             )
 
             allowed_scores = fine_log_probs[flat_idx].index_select(
-                0,
-                allowed_tensor,
+                dim=0,
+                index=allowed_tensor,
             )
 
             topk = min(per_beam_expand, allowed_tensor.numel())
-            topk_scores, topk_pos = torch.topk(allowed_scores, k=topk)
+
+            topk_scores, topk_pos = torch.topk(
+                allowed_scores,
+                k=topk,
+            )
+
             topk_ids = allowed_tensor[topk_pos]
 
             base_score = float(beam["score"])
@@ -454,17 +549,27 @@ def batch_generate_latent_interleaved_qwen(
 
             for j in range(topk):
                 fine_token_id = int(topk_ids[j].item())
+                fine_token_score = float(topk_scores[j].item())
+
+                fine_emb = embedding_weight[fine_token_id].unsqueeze(0)
+
+                # 下一步 context 追加：
+                # soft coarse embedding + selected fine embedding
+                new_extra_embeds = torch.cat(
+                    [
+                        beam["extra_embeds"],
+                        coarse_embeds[flat_idx].unsqueeze(0),
+                        fine_emb,
+                    ],
+                    dim=0,
+                )
 
                 raw_candidates.append(
                     {
                         "sample_id": sample_id,
-                        "from_flat_idx": flat_idx,
-                        "fine_token_id": fine_token_id,
                         "fine_token_ids": fine_prefix + [fine_token_id],
-                        "score": base_score + coarse_score + float(topk_scores[j].item()),
-                        "attention_after_coarse": attention_after_coarse[
-                            flat_idx:flat_idx + 1
-                        ],
+                        "score": base_score + coarse_score + fine_token_score,
+                        "extra_embeds": new_extra_embeds,
                     }
                 )
 
@@ -473,14 +578,14 @@ def batch_generate_latent_interleaved_qwen(
 
         grouped = [[] for _ in range(batch_size)]
 
-        for i, cand in enumerate(raw_candidates):
-            grouped[cand["sample_id"]].append(i)
+        for cand_idx, cand in enumerate(raw_candidates):
+            grouped[cand["sample_id"]].append(cand_idx)
 
-        survivor_indices = []
         new_beams_by_sample = [[] for _ in range(batch_size)]
 
         for sample_id in range(batch_size):
             cand_indices = grouped[sample_id]
+
             cand_indices.sort(
                 key=lambda i: raw_candidates[i]["score"],
                 reverse=True,
@@ -488,87 +593,24 @@ def batch_generate_latent_interleaved_qwen(
 
             seen = set()
 
-            for i in cand_indices:
-                key = tuple(raw_candidates[i]["fine_token_ids"])
+            for cand_idx in cand_indices:
+                key = tuple(raw_candidates[cand_idx]["fine_token_ids"])
+
                 if key in seen:
                     continue
 
                 seen.add(key)
-                survivor_indices.append(i)
 
-                if len(seen) >= num_beams:
+                new_beams_by_sample[sample_id].append(
+                    {
+                        "fine_token_ids": raw_candidates[cand_idx]["fine_token_ids"],
+                        "score": float(raw_candidates[cand_idx]["score"]),
+                        "extra_embeds": raw_candidates[cand_idx]["extra_embeds"],
+                    }
+                )
+
+                if len(new_beams_by_sample[sample_id]) >= num_beams:
                     break
-
-        if len(survivor_indices) == 0:
-            break
-
-        fine_token_ids = torch.tensor(
-            [raw_candidates[i]["fine_token_id"] for i in survivor_indices],
-            dtype=torch.long,
-            device=device,
-        )
-
-        fine_emb = embedding_weight.index_select(
-            0,
-            fine_token_ids,
-        ).unsqueeze(1)
-
-        survivor_flat_indices = [
-            raw_candidates[i]["from_flat_idx"]
-            for i in survivor_indices
-        ]
-
-        survivor_past_after_coarse = _select_past(
-            past_after_coarse,
-            survivor_flat_indices,
-        )
-
-        survivor_attention_after_coarse = torch.cat(
-            [
-                raw_candidates[i]["attention_after_coarse"]
-                for i in survivor_indices
-            ],
-            dim=0,
-        )
-
-        ones2 = torch.ones(
-            (len(survivor_indices), 1),
-            dtype=survivor_attention_after_coarse.dtype,
-            device=device,
-        )
-
-        attention_after_fine = torch.cat(
-            [survivor_attention_after_coarse, ones2],
-            dim=1,
-        )
-
-        out_after_fine = _model_forward_cached(
-            model,
-            inputs_embeds=fine_emb,
-            attention_mask=attention_after_fine,
-            past_key_values=survivor_past_after_coarse,
-        )
-
-        past_after_fine = out_after_fine.past_key_values
-        next_logits_after_fine = out_after_fine.logits[:, -1, :]
-
-        for new_idx, cand_idx in enumerate(survivor_indices):
-            cand = raw_candidates[cand_idx]
-            sample_id = cand["sample_id"]
-
-            new_beams_by_sample[sample_id].append(
-                {
-                    "fine_token_ids": cand["fine_token_ids"],
-                    "score": float(cand["score"]),
-                    "past": _slice_past(past_after_fine, new_idx),
-                    "attention_mask": attention_after_fine[
-                        new_idx:new_idx + 1
-                    ].contiguous(),
-                    "next_logits": next_logits_after_fine[
-                        new_idx:new_idx + 1
-                    ].contiguous(),
-                }
-            )
 
         beams_by_sample = new_beams_by_sample
 
@@ -599,6 +641,7 @@ def batch_generate_latent_interleaved_qwen(
                 beam["fine_token_ids"],
                 skip_special_tokens=True,
             )
+
             decoded.append(normalize_code_text(text))
             scores.append(float(beam["score"]))
 
@@ -644,11 +687,13 @@ def run_vanilla_generate(
             torch.cuda.empty_cache()
             num_beams -= 1
             print("Out of memory! Beam:", num_beams)
+
             if num_beams <= 0:
                 raise RuntimeError("num_beams reduced to 0 due to OOM.")
 
     output_ids = output["sequences"]
     scores = output["sequences_scores"]
+
     gen_ids = output_ids[:, prompt_len:]
     decoded = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
 
@@ -701,7 +746,6 @@ def test_ddp(args):
     model.eval()
 
     prompt_ids = parse_prompt_ids(args)
-
     test_data = load_test_dataset(args)
 
     ddp_sampler = DistributedSampler(
@@ -727,10 +771,10 @@ def test_ddp(args):
         coarse_position_token_ids = build_coarse_position_token_ids(test_data, tokenizer)
 
         if local_rank == 0:
-            print("[latent interleaved fast-cache] enabled")
-            print("[latent interleaved fast-cache] fine_code_len:", fine_code_len)
-            print("[latent interleaved fast-cache] coarse positions:", len(coarse_position_token_ids))
-            print("[latent interleaved fast-cache] fine trie size:", len(fine_trie))
+            print("[latent interleaved no-cache] enabled")
+            print("[latent interleaved no-cache] fine_code_len:", fine_code_len)
+            print("[latent interleaved no-cache] coarse positions:", len(coarse_position_token_ids))
+            print("[latent interleaved no-cache] fine trie size:", len(fine_trie))
     else:
         if local_rank == 0:
             print("[latent interleaved] disabled, using vanilla generate()")
@@ -769,6 +813,7 @@ def test_ddp(args):
 
             metrics_results = {}
             total = 0
+
             local_pairs = []
             local_txt_lines = []
 
@@ -776,8 +821,10 @@ def test_ddp(args):
 
             for step, batch in enumerate(pbar):
                 inputs = batch[0].to(device)
+
                 fine_targets = batch[1]
                 coarse_targets = batch[2]
+
                 bs = len(fine_targets)
                 prompt_len = inputs["input_ids"].shape[1]
 
@@ -819,11 +866,11 @@ def test_ddp(args):
 
                 if local_rank == 0 and step < 3:
                     empty_cnt = sum(
-                        1
-                        for x in decoded
+                        1 for x in decoded
                         if x is None or x.strip() == ""
                     )
                     sample0 = repr(decoded[0]) if decoded else None
+
                     print(
                         f"[debug] empty decoded: {empty_cnt}/{len(decoded)} ; sample0={sample0}"
                     )
@@ -856,13 +903,16 @@ def test_ddp(args):
                 local_pairs.extend(top1_pairs)
 
                 bs_gather_list = [None for _ in range(world_size)]
+
                 dist.all_gather_object(
                     object_list=bs_gather_list,
                     obj=bs,
                 )
+
                 total += sum(bs_gather_list)
 
                 res_gather_list = [None for _ in range(world_size)]
+
                 dist.all_gather_object(
                     object_list=res_gather_list,
                     obj=topk_res,
@@ -889,13 +939,13 @@ def test_ddp(args):
                         }
                         pbar.set_postfix(temp)
 
-                    if (step + 1) % 50 == 0 and total > 0:
-                        print(
-                            {
-                                m: metrics_results[m] / total
-                                for m in metrics_results
-                            }
-                        )
+                        if (step + 1) % 50 == 0:
+                            print(
+                                {
+                                    m: metrics_results[m] / total
+                                    for m in metrics_results
+                                }
+                            )
 
             dist.barrier()
 
@@ -926,6 +976,7 @@ def test_ddp(args):
 
         for m in metrics:
             all_res = [x[m] for x in all_prompt_results]
+
             mean_results[m] = sum(all_res) / len(all_res) if all_res else 0.0
             min_results[m] = min(all_res) if all_res else 0.0
             max_results[m] = max(all_res) if all_res else 0.0
@@ -939,6 +990,7 @@ def test_ddp(args):
         }
 
         result_dir = os.path.dirname(args.results_file)
+
         if result_dir:
             os.makedirs(result_dir, exist_ok=True)
 
@@ -952,8 +1004,10 @@ def test_ddp(args):
 
         if args.save_simple_results:
             simple_file = args.results_file + ".txt"
+
             with open(simple_file, "w", encoding="utf-8") as f:
                 f.write("\n".join(all_txt_lines_rank0))
+
             print("Saved simple results to:", simple_file)
 
     dist.barrier()
@@ -1044,7 +1098,7 @@ def add_interleaved_test_args(parser):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Fast latent interleaved HoloRec-Qwen DDP test"
+        description="Simple latent interleaved HoloRec-Qwen DDP test"
     )
 
     parser = parse_global_args(parser)
@@ -1053,4 +1107,5 @@ if __name__ == "__main__":
     parser = add_interleaved_test_args(parser)
 
     args = parser.parse_args()
+
     test_ddp(args)

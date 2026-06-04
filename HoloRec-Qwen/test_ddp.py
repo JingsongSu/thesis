@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-from peft import PeftModel
+from peft import PeftModel, LoraConfig, TaskType, get_peft_model
 
 from utils import *
 from collator import TestCollator
@@ -18,10 +18,456 @@ from prompt import all_prompt
 from evaluate import get_topk_results, get_metrics_results
 from generation_trie import Trie, build_trie_from_token_sequences
 
+try:
+    from safetensors.torch import load_file as safe_load_file
+except Exception:
+    safe_load_file = None
+
+
+def _rank0_print(*msg):
+    if int(os.environ.get("LOCAL_RANK") or 0) == 0:
+        print(*msg)
+
+
+def _split_arg_list(value):
+    if value is None:
+        return []
+
+    if isinstance(value, (list, tuple, set)):
+        return [str(x).strip() for x in value if str(x).strip()]
+
+    value = str(value).strip()
+    if not value:
+        return []
+
+    return [x.strip() for x in value.split(",") if x.strip()]
+
+
+def _has_tokenizer_files(path):
+    if not path or not os.path.isdir(path):
+        return False
+
+    names = [
+        "tokenizer_config.json",
+        "tokenizer.json",
+        "vocab.json",
+        "merges.txt",
+        "special_tokens_map.json",
+    ]
+
+    return any(os.path.exists(os.path.join(path, x)) for x in names)
+
+
+def _find_weight_files(ckpt_path):
+    """
+    支持以下 checkpoint 格式：
+
+    1. 标准 HF / Trainer:
+       model.safetensors
+       pytorch_model.bin
+
+    2. sharded:
+       model.safetensors.index.json
+       pytorch_model.bin.index.json
+
+    3. PEFT adapter 权重但缺 adapter_config.json:
+       adapter_model.safetensors
+       adapter_model.bin
+    """
+    if os.path.isfile(ckpt_path):
+        return [ckpt_path]
+
+    if not os.path.isdir(ckpt_path):
+        return []
+
+    index_candidates = [
+        "model.safetensors.index.json",
+        "pytorch_model.bin.index.json",
+        "adapter_model.safetensors.index.json",
+        "adapter_model.bin.index.json",
+    ]
+
+    for index_name in index_candidates:
+        index_path = os.path.join(ckpt_path, index_name)
+
+        if os.path.exists(index_path):
+            with open(index_path, "r", encoding="utf-8") as f:
+                index = json.load(f)
+
+            weight_map = index.get("weight_map", {})
+            files = sorted(set(weight_map.values()))
+
+            return [os.path.join(ckpt_path, x) for x in files]
+
+    single_candidates = [
+        "model.safetensors",
+        "pytorch_model.bin",
+        "adapter_model.safetensors",
+        "adapter_model.bin",
+    ]
+
+    for name in single_candidates:
+        path = os.path.join(ckpt_path, name)
+
+        if os.path.exists(path):
+            return [path]
+
+    return []
+
+
+def _load_state_dict_from_files(weight_files):
+    state_dict = {}
+
+    for weight_file in weight_files:
+        if weight_file.endswith(".safetensors"):
+            if safe_load_file is None:
+                raise ImportError(
+                    "Need safetensors to load .safetensors checkpoint. "
+                    "Please run: pip install safetensors"
+                )
+
+            part = safe_load_file(weight_file, device="cpu")
+
+        else:
+            part = torch.load(weight_file, map_location="cpu")
+
+            if isinstance(part, dict):
+                for key in ["state_dict", "model", "module"]:
+                    if key in part and isinstance(part[key], dict):
+                        part = part[key]
+                        break
+
+        if not isinstance(part, dict):
+            raise ValueError(f"Unsupported checkpoint format: {weight_file}")
+
+        state_dict.update(part)
+
+    return state_dict
+
+
+def _state_dict_has_lora(state_dict):
+    for key in state_dict.keys():
+        if "lora_A" in key or "lora_B" in key:
+            return True
+
+    return False
+
+
+def _infer_lora_targets_from_state_dict(state_dict):
+    targets = set()
+
+    for key in state_dict.keys():
+        if ".lora_A." in key and key.endswith(".weight"):
+            prefix = key.split(".lora_A.")[0]
+            module_name = prefix.split(".")[-1]
+
+            if module_name:
+                targets.add(module_name)
+
+        if ".lora_A.weight" in key:
+            prefix = key.split(".lora_A.weight")[0]
+            module_name = prefix.split(".")[-1]
+
+            if module_name:
+                targets.add(module_name)
+
+    return sorted(targets)
+
+
+def _infer_modules_to_save_from_state_dict(state_dict):
+    modules_to_save = set()
+
+    for key in state_dict.keys():
+        if ".modules_to_save." in key:
+            prefix = key.split(".modules_to_save.")[0]
+            module_name = prefix.split(".")[-1]
+
+            if module_name:
+                modules_to_save.add(module_name)
+
+        if ".modules_to_save.weight" in key:
+            prefix = key.split(".modules_to_save.weight")[0]
+            module_name = prefix.split(".")[-1]
+
+            if module_name:
+                modules_to_save.add(module_name)
+
+    return sorted(modules_to_save)
+
+
+def _infer_lora_r_from_state_dict(state_dict):
+    for key, value in state_dict.items():
+        if ".lora_A." in key and key.endswith(".weight"):
+            if hasattr(value, "shape") and len(value.shape) >= 1:
+                return int(value.shape[0])
+
+        if ".lora_A.weight" in key:
+            if hasattr(value, "shape") and len(value.shape) >= 1:
+                return int(value.shape[0])
+
+    return None
+
+
+def _build_lora_config_for_test(args, raw_state_dict=None):
+    """
+    和 lora_finetune.py 保持一致：
+
+    - 优先使用 utils.py / parse_train_args 中的 LoRA 参数。
+    - 如果参数为空，再从 checkpoint 里推断。
+    - 如果仍然没有，再使用 lora_finetune.py 里的 fallback。
+    """
+    inferred_targets = []
+    inferred_modules_to_save = []
+    inferred_r = None
+
+    if raw_state_dict is not None:
+        inferred_targets = _infer_lora_targets_from_state_dict(raw_state_dict)
+        inferred_modules_to_save = _infer_modules_to_save_from_state_dict(raw_state_dict)
+        inferred_r = _infer_lora_r_from_state_dict(raw_state_dict)
+
+    target_modules = _split_arg_list(getattr(args, "lora_target_modules", ""))
+
+    if len(target_modules) == 0:
+        if len(inferred_targets) > 0:
+            target_modules = inferred_targets
+        else:
+            target_modules = [
+                "qkv_proj",
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ]
+
+    modules_to_save = _split_arg_list(getattr(args, "lora_modules_to_save", ""))
+
+    if len(modules_to_save) == 0:
+        if len(inferred_modules_to_save) > 0:
+            modules_to_save = inferred_modules_to_save
+        else:
+            modules_to_save = ["embed_tokens", "lm_head"]
+
+    lora_r = getattr(args, "lora_r", None)
+    if lora_r is None:
+        lora_r = inferred_r
+    if lora_r is None:
+        lora_r = 16
+
+    lora_alpha = getattr(args, "lora_alpha", 32)
+    lora_dropout = getattr(args, "lora_dropout", 0.05)
+
+    _rank0_print("[ckpt loader] LoRA target_modules:", target_modules)
+    _rank0_print("[ckpt loader] LoRA modules_to_save:", modules_to_save)
+    _rank0_print("[ckpt loader] LoRA r:", lora_r)
+    _rank0_print("[ckpt loader] LoRA alpha:", lora_alpha)
+    _rank0_print("[ckpt loader] LoRA dropout:", lora_dropout)
+
+    return LoraConfig(
+        r=int(lora_r),
+        lora_alpha=int(lora_alpha),
+        target_modules=target_modules,
+        modules_to_save=modules_to_save,
+        lora_dropout=float(lora_dropout),
+        bias="none",
+        inference_mode=True,
+        task_type=TaskType.CAUSAL_LM,
+    )
+
+
+def _insert_default_adapter_name(key):
+    key = key.replace(".lora_A.weight", ".lora_A.default.weight")
+    key = key.replace(".lora_B.weight", ".lora_B.default.weight")
+    key = key.replace(".lora_embedding_A.weight", ".lora_embedding_A.default.weight")
+    key = key.replace(".lora_embedding_B.weight", ".lora_embedding_B.default.weight")
+    key = key.replace(".modules_to_save.weight", ".modules_to_save.default.weight")
+    return key
+
+
+def _remap_key_identity(key):
+    return key
+
+
+def _remap_key_insert_default(key):
+    return _insert_default_adapter_name(key)
+
+
+def _remap_key_strip_module(key):
+    if key.startswith("module."):
+        key = key[len("module."):]
+
+    return key
+
+
+def _remap_key_strip_module_insert_default(key):
+    return _insert_default_adapter_name(_remap_key_strip_module(key))
+
+
+def _remap_key_strip_one_base_model(key):
+    if key.startswith("base_model."):
+        key = key[len("base_model."):]
+
+    return key
+
+
+def _remap_key_strip_one_base_model_insert_default(key):
+    return _insert_default_adapter_name(_remap_key_strip_one_base_model(key))
+
+
+def _remap_key_strip_two_base_model(key):
+    for _ in range(2):
+        if key.startswith("base_model."):
+            key = key[len("base_model."):]
+
+    return key
+
+
+def _remap_key_strip_two_base_model_insert_default(key):
+    return _insert_default_adapter_name(_remap_key_strip_two_base_model(key))
+
+
+def _remap_key_strip_module_then_one_base_model(key):
+    key = _remap_key_strip_module(key)
+    key = _remap_key_strip_one_base_model(key)
+    return key
+
+
+def _remap_key_strip_module_then_one_base_model_insert_default(key):
+    return _insert_default_adapter_name(_remap_key_strip_module_then_one_base_model(key))
+
+
+def _remap_key_add_peft_prefix(key):
+    if key.startswith("module."):
+        key = key[len("module."):]
+
+    if key.startswith("base_model."):
+        return key
+
+    return "base_model.model." + key
+
+
+def _remap_key_add_peft_prefix_insert_default(key):
+    return _insert_default_adapter_name(_remap_key_add_peft_prefix(key))
+
+
+def _remap_key_strip_wrapper_prefix(key):
+    """
+    训练时 Trainer 保存的是 InterleavedLatentQwen wrapper。
+    wrapper 里实际 PEFT 模型字段名也是 base_model。
+
+    可能出现：
+      base_model.base_model.model.model.layers...
+    测试时直接构造的是 PeftModel：
+      base_model.model.model.layers...
+
+    所以需要去掉最外层 wrapper 的 base_model。
+    """
+    if key.startswith("base_model.base_model."):
+        return key[len("base_model."):]
+
+    return key
+
+
+def _remap_key_strip_wrapper_prefix_insert_default(key):
+    return _insert_default_adapter_name(_remap_key_strip_wrapper_prefix(key))
+
+
+def _load_best_matched_state_dict(model, raw_state_dict):
+    """
+    Trainer checkpoint / wrapper checkpoint / PEFT checkpoint 的 key 前缀可能不同。
+    这里尝试多种安全映射，只加载 shape 完全一致的 tensor。
+    """
+    model_state = model.state_dict()
+
+    remappers = [
+        ("identity", _remap_key_identity),
+        ("insert_default", _remap_key_insert_default),
+        ("strip_module", _remap_key_strip_module),
+        ("strip_module_insert_default", _remap_key_strip_module_insert_default),
+        ("strip_wrapper_prefix", _remap_key_strip_wrapper_prefix),
+        ("strip_wrapper_prefix_insert_default", _remap_key_strip_wrapper_prefix_insert_default),
+        ("strip_one_base_model", _remap_key_strip_one_base_model),
+        ("strip_one_base_model_insert_default", _remap_key_strip_one_base_model_insert_default),
+        ("strip_two_base_model", _remap_key_strip_two_base_model),
+        ("strip_two_base_model_insert_default", _remap_key_strip_two_base_model_insert_default),
+        ("strip_module_then_one_base_model", _remap_key_strip_module_then_one_base_model),
+        ("strip_module_then_one_base_model_insert_default", _remap_key_strip_module_then_one_base_model_insert_default),
+        ("add_peft_prefix", _remap_key_add_peft_prefix),
+        ("add_peft_prefix_insert_default", _remap_key_add_peft_prefix_insert_default),
+    ]
+
+    best_name = None
+    best_matched = None
+    best_count = -1
+
+    for name, remap_fn in remappers:
+        matched = {}
+
+        for old_key, tensor in raw_state_dict.items():
+            new_key = remap_fn(old_key)
+
+            if new_key not in model_state:
+                continue
+
+            if tuple(tensor.shape) != tuple(model_state[new_key].shape):
+                continue
+
+            matched[new_key] = tensor
+
+        if len(matched) > best_count:
+            best_count = len(matched)
+            best_name = name
+            best_matched = matched
+
+    if best_matched is None or len(best_matched) == 0:
+        sample_ckpt_keys = list(raw_state_dict.keys())[:30]
+        sample_model_keys = list(model_state.keys())[:30]
+
+        raise RuntimeError(
+            "No checkpoint weights matched current model.\n"
+            f"Sample checkpoint keys: {sample_ckpt_keys}\n"
+            f"Sample model keys: {sample_model_keys}\n"
+            "Please check --base_model, tokenizer, and LoRA hyperparameters."
+        )
+
+    incompatible = model.load_state_dict(best_matched, strict=False)
+
+    _rank0_print(
+        f"[ckpt loader] loaded {len(best_matched)}/{len(raw_state_dict)} tensors "
+        f"with key remap: {best_name}"
+    )
+    _rank0_print(
+        f"[ckpt loader] missing keys: {len(incompatible.missing_keys)}, "
+        f"unexpected keys: {len(incompatible.unexpected_keys)}"
+    )
+
+    if int(os.environ.get("LOCAL_RANK") or 0) == 0:
+        if len(incompatible.missing_keys) > 0:
+            print("[ckpt loader] first missing keys:", incompatible.missing_keys[:10])
+
+        if len(incompatible.unexpected_keys) > 0:
+            print("[ckpt loader] first unexpected keys:", incompatible.unexpected_keys[:10])
+
+
+def _get_compute_dtype(args):
+    if getattr(args, "use_bf16", False) or getattr(args, "bf16", False):
+        return torch.bfloat16
+
+    if getattr(args, "use_fp16", False) or getattr(args, "fp16", False):
+        return torch.float16
+
+    return torch.bfloat16
+
 
 def build_model_and_tokenizer(args, device_map):
+    ckpt_path = args.ckpt_path
+
+    tokenizer_path = ckpt_path if _has_tokenizer_files(ckpt_path) else args.base_model
+
     tokenizer = AutoTokenizer.from_pretrained(
-        args.ckpt_path,
+        tokenizer_path,
         trust_remote_code=True,
         use_fast=True,
     )
@@ -30,14 +476,13 @@ def build_model_and_tokenizer(args, device_map):
         tokenizer.pad_token = tokenizer.eos_token
 
     tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
+
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
     tokenizer.padding_side = "left"
 
-    if getattr(args, "use_bf16", False):
-        dtype = torch.bfloat16
-    elif getattr(args, "use_fp16", False):
-        dtype = torch.float16
-    else:
-        dtype = torch.bfloat16
+    dtype = _get_compute_dtype(args)
 
     model_kwargs = dict(
         device_map=device_map,
@@ -49,7 +494,19 @@ def build_model_and_tokenizer(args, device_map):
     if getattr(args, "attn_implementation", None):
         model_kwargs["attn_implementation"] = args.attn_implementation
 
-    if args.lora:
+    if getattr(args, "load_in_8bit", False):
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_8bit=True,
+            llm_int8_threshold=6.0,
+            llm_int8_has_fp16_weight=False,
+        )
+
+    adapter_config_path = os.path.join(ckpt_path, "adapter_config.json")
+    has_adapter_config = os.path.exists(adapter_config_path)
+
+    if getattr(args, "lora", False) and has_adapter_config:
+        _rank0_print("[ckpt loader] loading standard PEFT adapter checkpoint")
+
         base = AutoModelForCausalLM.from_pretrained(
             args.base_model,
             **model_kwargs,
@@ -58,22 +515,62 @@ def build_model_and_tokenizer(args, device_map):
 
         model = PeftModel.from_pretrained(
             base,
-            args.ckpt_path,
+            ckpt_path,
             device_map=device_map,
             torch_dtype=dtype,
         )
-    else:
-        if getattr(args, "load_in_8bit", False):
-            model_kwargs["quantization_config"] = BitsAndBytesConfig(
-                load_in_8bit=True,
-                llm_int8_threshold=6.0,
-                llm_int8_has_fp16_weight=False,
-            )
 
-        model = AutoModelForCausalLM.from_pretrained(
-            args.ckpt_path,
-            **model_kwargs,
-        )
+    else:
+        weight_files = _find_weight_files(ckpt_path)
+
+        if len(weight_files) > 0:
+            _rank0_print("[ckpt loader] loading raw checkpoint weights:")
+            for wf in weight_files:
+                _rank0_print("  -", wf)
+
+            raw_state_dict = _load_state_dict_from_files(weight_files)
+            has_lora_weights = _state_dict_has_lora(raw_state_dict)
+
+            base = AutoModelForCausalLM.from_pretrained(
+                args.base_model,
+                **model_kwargs,
+            )
+            base.resize_token_embeddings(len(tokenizer))
+
+            if getattr(args, "lora", False) or has_lora_weights:
+                if has_lora_weights:
+                    _rank0_print("[ckpt loader] LoRA weights detected in raw checkpoint")
+                else:
+                    _rank0_print("[ckpt loader] --lora enabled, but no LoRA keys detected")
+
+                lora_config = _build_lora_config_for_test(
+                    args=args,
+                    raw_state_dict=raw_state_dict,
+                )
+                model = get_peft_model(base, lora_config)
+
+            else:
+                _rank0_print("[ckpt loader] no LoRA weights detected; loading as full model state_dict")
+                model = base
+
+            _load_best_matched_state_dict(model, raw_state_dict)
+
+            del raw_state_dict
+            torch.cuda.empty_cache()
+
+        else:
+            _rank0_print("[ckpt loader] no raw weight file found; fallback to AutoModelForCausalLM.from_pretrained")
+
+            model_source = ckpt_path
+
+            if not os.path.exists(os.path.join(ckpt_path, "config.json")):
+                model_source = args.base_model
+
+            model = AutoModelForCausalLM.from_pretrained(
+                model_source,
+                **model_kwargs,
+            )
+            model.resize_token_embeddings(len(tokenizer))
 
     if hasattr(model.config, "use_cache"):
         model.config.use_cache = False
@@ -91,6 +588,7 @@ def gather_object_list(local_obj, world_size):
     for part in gathered:
         if part is None:
             continue
+
         if isinstance(part, list):
             merged.extend(part)
         else:
@@ -102,6 +600,7 @@ def gather_object_list(local_obj, world_size):
 def normalize_code_text(x):
     if x is None:
         return None
+
     return str(x).strip().replace(" ", "")
 
 
@@ -114,16 +613,20 @@ def token_to_id(tokenizer, token: str) -> int:
 
     if token_id is None:
         encoded = tokenizer(token, add_special_tokens=False).get("input_ids", [])
+
         if len(encoded) == 1:
             return int(encoded[0])
+
         raise ValueError(f"Token {token!r} is not a single tokenizer id: {encoded}")
 
     unk_id = getattr(tokenizer, "unk_token_id", None)
 
     if unk_id is not None and token_id == unk_id:
         encoded = tokenizer(token, add_special_tokens=False).get("input_ids", [])
+
         if len(encoded) == 1:
             return int(encoded[0])
+
         raise ValueError(f"Token {token!r} is mapped to unk or multiple ids: {encoded}")
 
     return int(token_id)
@@ -178,8 +681,10 @@ def build_coarse_position_token_ids(test_data, tokenizer) -> List[List[int]]:
 def _to_list(x):
     if x is None:
         return []
+
     if isinstance(x, (list, tuple, set)):
         return list(x)
+
     return [x]
 
 
@@ -204,11 +709,13 @@ def unwrap_modules_to_save_embedding(module):
 
         if hasattr(module, "active_adapters"):
             active_adapters = getattr(module, "active_adapters")
+
             if callable(active_adapters):
                 try:
                     active_adapters = active_adapters()
                 except TypeError:
                     active_adapters = None
+
             active_names.extend(_to_list(active_adapters))
 
         if hasattr(module, "_active_adapter"):
@@ -234,6 +741,7 @@ def unwrap_modules_to_save_embedding(module):
         for name in clean_names:
             if name in modules_to_save:
                 candidate = modules_to_save[name]
+
                 if hasattr(candidate, "weight"):
                     return candidate
 
@@ -245,6 +753,11 @@ def unwrap_modules_to_save_embedding(module):
 
     if original_module is not None and hasattr(original_module, "weight"):
         return original_module
+
+    base_layer = getattr(module, "base_layer", None)
+
+    if base_layer is not None and hasattr(base_layer, "weight"):
+        return base_layer
 
     child = getattr(module, "module", None)
 
@@ -259,16 +772,18 @@ def unwrap_modules_to_save_embedding(module):
 
 def get_model_input_embeddings(model):
     """
-    兼容普通 HF model 和 PEFT/Lora model。
+    兼容普通 HF model 和 PEFT / LoRA model。
     返回真正的 embedding module。
     """
     if hasattr(model, "get_input_embeddings"):
         emb = model.get_input_embeddings()
+
         if emb is not None:
             return unwrap_modules_to_save_embedding(emb)
 
     if hasattr(model, "base_model") and hasattr(model.base_model, "get_input_embeddings"):
         emb = model.base_model.get_input_embeddings()
+
         if emb is not None:
             return unwrap_modules_to_save_embedding(emb)
 
@@ -281,7 +796,8 @@ def get_model_input_embeddings(model):
 def model_next_logits_no_cache(model, inputs_embeds, attention_mask):
     """
     no-cache forward。
-    输入完整 hidden prefix，返回最后一个位置预测下一个 token 的 logits。
+
+    不传 past_key_values，避免 Qwen3 / Transformers 新 Cache API 和 tuple cache 不兼容。
     """
     outputs = model(
         inputs_embeds=inputs_embeds,
@@ -303,21 +819,10 @@ def predict_soft_coarse_embedding(
     use_coarse_score,
 ):
     """
-    推理阶段：
-        coarse logits -> soft coarse embedding
+    coarse logits -> soft coarse embedding。
 
-    coarse 不解码成文本，不作为显式 token 输出。
-    只在当前 coarse codebook 上做 softmax，然后对 embedding 加权求和。
-
-    next_logits:
-        [B, vocab_size]
-
-    coarse_token_ids:
-        当前 coarse 位置允许的 coarse token id 列表
-
-    return:
-        soft_coarse_emb: [B, hidden_size]
-        coarse_score:    [B]
+    coarse token 不解码成文本，只在当前 coarse codebook 上 softmax，
+    然后对 embedding 做加权求和。
     """
     ids = torch.tensor(
         coarse_token_ids,
@@ -326,7 +831,6 @@ def predict_soft_coarse_embedding(
     )
 
     candidate_logits = next_logits.index_select(dim=-1, index=ids)
-
     log_probs = F.log_softmax(candidate_logits.float(), dim=-1)
 
     probs = F.softmax(
@@ -335,12 +839,9 @@ def predict_soft_coarse_embedding(
     ).to(dtype=embedding_weight.dtype)
 
     candidate_embeds = embedding_weight.index_select(dim=0, index=ids)
-
     soft_coarse_emb = probs @ candidate_embeds
 
     if use_coarse_score:
-        # 这里是 soft distribution 的期望 log-prob。
-        # 默认关闭，不参与 beam 排序。
         coarse_score = torch.sum(probs.float() * log_probs, dim=-1)
     else:
         coarse_score = torch.zeros(
@@ -365,25 +866,22 @@ def batch_generate_latent_interleaved_qwen(
     use_coarse_score_in_rank: bool = False,
 ):
     """
-    简单 no-cache 隐式交错推理。
+    no-cache 隐式交错推理。
 
     每个 fine code 位置执行：
 
-        context
-          -> coarse logits
-          -> soft coarse embedding
-          -> fine logits
-          -> select fine token
-          -> append soft coarse emb + fine emb to context
+      context
+      -> coarse logits
+      -> soft coarse embedding
+      -> fine logits
+      -> select fine token
+      -> append soft coarse embedding + fine embedding to context
 
     输出只 decode fine tokens。
-    coarse tokens 永远不作为文本输出。
     """
     device = inputs["input_ids"].device
-
     input_ids = inputs["input_ids"]
     attention_mask = inputs["attention_mask"]
-
     batch_size = input_ids.size(0)
 
     embedding_module = get_model_input_embeddings(model)
@@ -430,15 +928,16 @@ def batch_generate_latent_interleaved_qwen(
 
         for flat_idx, beam in enumerate(flat_beams):
             sample_id = flat_sample_ids[flat_idx]
-
             sample_prompt_embeds = prompt_embeds[sample_id]
             sample_prompt_mask = attention_mask[sample_id]
-
             extra_embeds = beam["extra_embeds"]
 
             if extra_embeds.size(0) > 0:
                 full_embeds = torch.cat(
-                    [sample_prompt_embeds, extra_embeds],
+                    [
+                        sample_prompt_embeds,
+                        extra_embeds,
+                    ],
                     dim=0,
                 )
 
@@ -449,9 +948,13 @@ def batch_generate_latent_interleaved_qwen(
                 )
 
                 full_attention = torch.cat(
-                    [sample_prompt_mask, extra_attention],
+                    [
+                        sample_prompt_mask,
+                        extra_attention,
+                    ],
                     dim=0,
                 )
+
             else:
                 full_embeds = sample_prompt_embeds
                 full_attention = sample_prompt_mask
@@ -462,14 +965,12 @@ def batch_generate_latent_interleaved_qwen(
         full_inputs_embeds = torch.stack(full_embeds_list, dim=0)
         full_attention_mask = torch.stack(full_attention_list, dim=0)
 
-        # 1. 当前 context 预测隐式 coarse。
         coarse_logits = model_next_logits_no_cache(
             model=model,
             inputs_embeds=full_inputs_embeds,
             attention_mask=full_attention_mask,
         )
 
-        # 2. coarse logits 转为 soft coarse embedding。
         coarse_pos = min(step_idx, len(coarse_position_token_ids) - 1)
         coarse_ids_this_pos = coarse_position_token_ids[coarse_pos]
 
@@ -484,9 +985,11 @@ def batch_generate_latent_interleaved_qwen(
             use_coarse_score=use_coarse_score_in_rank,
         )
 
-        # 3. context + soft coarse embedding 预测显式 fine token。
         inputs_after_coarse = torch.cat(
-            [full_inputs_embeds, coarse_embeds.unsqueeze(1)],
+            [
+                full_inputs_embeds,
+                coarse_embeds.unsqueeze(1),
+            ],
             dim=1,
         )
 
@@ -497,7 +1000,10 @@ def batch_generate_latent_interleaved_qwen(
         )
 
         attention_after_coarse = torch.cat(
-            [full_attention_mask, ones],
+            [
+                full_attention_mask,
+                ones,
+            ],
             dim=1,
         )
 
@@ -553,8 +1059,6 @@ def batch_generate_latent_interleaved_qwen(
 
                 fine_emb = embedding_weight[fine_token_id].unsqueeze(0)
 
-                # 下一步 context 追加：
-                # soft coarse embedding + selected fine embedding
                 new_extra_embeds = torch.cat(
                     [
                         beam["extra_embeds"],
@@ -683,6 +1187,7 @@ def run_vanilla_generate(
                 use_cache=True,
             )
             break
+
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
             num_beams -= 1
@@ -742,10 +1247,10 @@ def test_ddp(args):
         args,
         device_map=device_map,
     )
-
     model.eval()
 
     prompt_ids = parse_prompt_ids(args)
+
     test_data = load_test_dataset(args)
 
     ddp_sampler = DistributedSampler(
@@ -775,6 +1280,7 @@ def test_ddp(args):
             print("[latent interleaved no-cache] fine_code_len:", fine_code_len)
             print("[latent interleaved no-cache] coarse positions:", len(coarse_position_token_ids))
             print("[latent interleaved no-cache] fine trie size:", len(fine_trie))
+
     else:
         if local_rank == 0:
             print("[latent interleaved] disabled, using vanilla generate()")
@@ -797,12 +1303,12 @@ def test_ddp(args):
     all_pairs_rank0 = []
     all_txt_lines_rank0 = []
 
-    if getattr(args, "use_bf16", False):
+    amp_dtype = None
+
+    if getattr(args, "use_bf16", False) or getattr(args, "bf16", False):
         amp_dtype = torch.bfloat16
-    elif getattr(args, "use_fp16", False):
+    elif getattr(args, "use_fp16", False) or getattr(args, "fp16", False):
         amp_dtype = torch.float16
-    else:
-        amp_dtype = None
 
     with torch.inference_mode():
         for prompt_id in prompt_ids:
@@ -813,7 +1319,6 @@ def test_ddp(args):
 
             metrics_results = {}
             total = 0
-
             local_pairs = []
             local_txt_lines = []
 
@@ -821,10 +1326,8 @@ def test_ddp(args):
 
             for step, batch in enumerate(pbar):
                 inputs = batch[0].to(device)
-
                 fine_targets = batch[1]
                 coarse_targets = batch[2]
-
                 bs = len(fine_targets)
                 prompt_len = inputs["input_ids"].shape[1]
 
@@ -842,6 +1345,7 @@ def test_ddp(args):
                                 coarse_temperature=args.interleaved_temperature,
                                 use_coarse_score_in_rank=args.use_coarse_score_in_rank,
                             )
+
                     else:
                         decoded, scores = batch_generate_latent_interleaved_qwen(
                             model=model,
@@ -854,6 +1358,7 @@ def test_ddp(args):
                             coarse_temperature=args.interleaved_temperature,
                             use_coarse_score_in_rank=args.use_coarse_score_in_rank,
                         )
+
                 else:
                     decoded, scores = run_vanilla_generate(
                         model=model,
@@ -939,13 +1444,13 @@ def test_ddp(args):
                         }
                         pbar.set_postfix(temp)
 
-                        if (step + 1) % 50 == 0:
-                            print(
-                                {
-                                    m: metrics_results[m] / total
-                                    for m in metrics_results
-                                }
-                            )
+                    if (step + 1) % 50 == 0 and total > 0:
+                        print(
+                            {
+                                m: metrics_results[m] / total
+                                for m in metrics_results
+                            }
+                        )
 
             dist.barrier()
 
@@ -976,7 +1481,6 @@ def test_ddp(args):
 
         for m in metrics:
             all_res = [x[m] for x in all_prompt_results]
-
             mean_results[m] = sum(all_res) / len(all_res) if all_res else 0.0
             min_results[m] = min(all_res) if all_res else 0.0
             max_results[m] = max(all_res) if all_res else 0.0
@@ -1020,73 +1524,61 @@ def add_interleaved_test_args(parser):
         type=str,
         default=".tw8.json",
     )
-
     parser.add_argument(
         "--interleaved_temperature",
         type=float,
         default=0.8,
     )
-
     parser.add_argument(
         "--interleaved_inference",
         action="store_true",
         default=True,
     )
-
     parser.add_argument(
         "--no_interleaved_inference",
         dest="interleaved_inference",
         action="store_false",
     )
-
     parser.add_argument(
         "--use_coarse_score_in_rank",
         action="store_true",
         default=False,
     )
-
     parser.add_argument(
         "--eval_coarse_as_correct",
         action="store_true",
         default=False,
     )
-
     parser.add_argument(
         "--save_simple_results",
         action="store_true",
         default=False,
     )
-
     parser.add_argument(
         "--max_new_tokens",
         type=int,
         default=10,
     )
-
     parser.add_argument(
         "--use_bf16",
         action="store_true",
         default=True,
     )
-
     parser.add_argument(
         "--use_fp16",
         action="store_true",
         default=False,
     )
-
     parser.add_argument(
         "--load_in_8bit",
         action="store_true",
         default=False,
     )
-
     parser.add_argument(
         "--attn_implementation",
         type=str,
         default="flash_attention_2",
     )
-
     parser.add_argument(
         "--num_workers",
         type=int,
@@ -1102,6 +1594,16 @@ if __name__ == "__main__":
     )
 
     parser = parse_global_args(parser)
+
+    # 这里调用 utils.py 里的训练参数解析，主要是为了复用其中的 LoRA 参数：
+    # --lora_r
+    # --lora_alpha
+    # --lora_dropout
+    # --lora_target_modules
+    # --lora_modules_to_save
+    # 这些参数和 lora_finetune.py 训练时保持一致。
+    parser = parse_train_args(parser)
+
     parser = parse_dataset_args(parser)
     parser = parse_test_args(parser)
     parser = add_interleaved_test_args(parser)

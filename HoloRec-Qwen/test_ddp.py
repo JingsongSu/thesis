@@ -37,6 +37,7 @@ def _split_arg_list(value):
         return [str(x).strip() for x in value if str(x).strip()]
 
     value = str(value).strip()
+
     if not value:
         return []
 
@@ -60,19 +61,21 @@ def _has_tokenizer_files(path):
 
 def _find_weight_files(ckpt_path):
     """
-    支持以下 checkpoint 格式：
+    支持以下 checkpoint 结构：
 
-    1. 标准 HF / Trainer:
+    1. 标准 Trainer / HF checkpoint:
        model.safetensors
        pytorch_model.bin
 
-    2. sharded:
+    2. sharded checkpoint:
        model.safetensors.index.json
        pytorch_model.bin.index.json
 
     3. PEFT adapter 权重但缺 adapter_config.json:
        adapter_model.safetensors
        adapter_model.bin
+
+    4. 直接传入单个 .safetensors / .bin 文件。
     """
     if os.path.isfile(ckpt_path):
         return [ckpt_path]
@@ -213,8 +216,8 @@ def _build_lora_config_for_test(args, raw_state_dict=None):
     和 lora_finetune.py 保持一致：
 
     - 优先使用 utils.py / parse_train_args 中的 LoRA 参数。
-    - 如果参数为空，再从 checkpoint 里推断。
-    - 如果仍然没有，再使用 lora_finetune.py 里的 fallback。
+    - 如果命令行参数为空，再从 checkpoint 里推断。
+    - 如果仍然推断不到，再使用训练脚本里的 fallback。
     """
     inferred_targets = []
     inferred_modules_to_save = []
@@ -251,8 +254,10 @@ def _build_lora_config_for_test(args, raw_state_dict=None):
             modules_to_save = ["embed_tokens", "lm_head"]
 
     lora_r = getattr(args, "lora_r", None)
+
     if lora_r is None:
         lora_r = inferred_r
+
     if lora_r is None:
         lora_r = 16
 
@@ -305,6 +310,28 @@ def _remap_key_strip_module_insert_default(key):
     return _insert_default_adapter_name(_remap_key_strip_module(key))
 
 
+def _remap_key_strip_wrapper_prefix(key):
+    """
+    训练时 Trainer 保存的是 InterleavedLatentQwen wrapper。
+    wrapper 内部的真实 PEFT 模型字段名也是 base_model。
+
+    可能出现：
+      base_model.base_model.model.model.layers...
+    测试时直接构造 PeftModel：
+      base_model.model.model.layers...
+
+    因此去掉最外层 wrapper 的 base_model。
+    """
+    if key.startswith("base_model.base_model."):
+        return key[len("base_model."):]
+
+    return key
+
+
+def _remap_key_strip_wrapper_prefix_insert_default(key):
+    return _insert_default_adapter_name(_remap_key_strip_wrapper_prefix(key))
+
+
 def _remap_key_strip_one_base_model(key):
     if key.startswith("base_model."):
         key = key[len("base_model."):]
@@ -326,6 +353,16 @@ def _remap_key_strip_two_base_model(key):
 
 def _remap_key_strip_two_base_model_insert_default(key):
     return _insert_default_adapter_name(_remap_key_strip_two_base_model(key))
+
+
+def _remap_key_strip_module_then_wrapper_prefix(key):
+    key = _remap_key_strip_module(key)
+    key = _remap_key_strip_wrapper_prefix(key)
+    return key
+
+
+def _remap_key_strip_module_then_wrapper_prefix_insert_default(key):
+    return _insert_default_adapter_name(_remap_key_strip_module_then_wrapper_prefix(key))
 
 
 def _remap_key_strip_module_then_one_base_model(key):
@@ -352,28 +389,6 @@ def _remap_key_add_peft_prefix_insert_default(key):
     return _insert_default_adapter_name(_remap_key_add_peft_prefix(key))
 
 
-def _remap_key_strip_wrapper_prefix(key):
-    """
-    训练时 Trainer 保存的是 InterleavedLatentQwen wrapper。
-    wrapper 里实际 PEFT 模型字段名也是 base_model。
-
-    可能出现：
-      base_model.base_model.model.model.layers...
-    测试时直接构造的是 PeftModel：
-      base_model.model.model.layers...
-
-    所以需要去掉最外层 wrapper 的 base_model。
-    """
-    if key.startswith("base_model.base_model."):
-        return key[len("base_model."):]
-
-    return key
-
-
-def _remap_key_strip_wrapper_prefix_insert_default(key):
-    return _insert_default_adapter_name(_remap_key_strip_wrapper_prefix(key))
-
-
 def _load_best_matched_state_dict(model, raw_state_dict):
     """
     Trainer checkpoint / wrapper checkpoint / PEFT checkpoint 的 key 前缀可能不同。
@@ -392,8 +407,16 @@ def _load_best_matched_state_dict(model, raw_state_dict):
         ("strip_one_base_model_insert_default", _remap_key_strip_one_base_model_insert_default),
         ("strip_two_base_model", _remap_key_strip_two_base_model),
         ("strip_two_base_model_insert_default", _remap_key_strip_two_base_model_insert_default),
+        ("strip_module_then_wrapper_prefix", _remap_key_strip_module_then_wrapper_prefix),
+        (
+            "strip_module_then_wrapper_prefix_insert_default",
+            _remap_key_strip_module_then_wrapper_prefix_insert_default,
+        ),
         ("strip_module_then_one_base_model", _remap_key_strip_module_then_one_base_model),
-        ("strip_module_then_one_base_model_insert_default", _remap_key_strip_module_then_one_base_model_insert_default),
+        (
+            "strip_module_then_one_base_model_insert_default",
+            _remap_key_strip_module_then_one_base_model_insert_default,
+        ),
         ("add_peft_prefix", _remap_key_add_peft_prefix),
         ("add_peft_prefix_insert_default", _remap_key_add_peft_prefix_insert_default),
     ]
@@ -504,6 +527,10 @@ def build_model_and_tokenizer(args, device_map):
     adapter_config_path = os.path.join(ckpt_path, "adapter_config.json")
     has_adapter_config = os.path.exists(adapter_config_path)
 
+    # Case 1:
+    # 标准 PEFT adapter checkpoint:
+    #   adapter_config.json
+    #   adapter_model.safetensors / adapter_model.bin
     if getattr(args, "lora", False) and has_adapter_config:
         _rank0_print("[ckpt loader] loading standard PEFT adapter checkpoint")
 
@@ -523,6 +550,12 @@ def build_model_and_tokenizer(args, device_map):
     else:
         weight_files = _find_weight_files(ckpt_path)
 
+        # Case 2:
+        # Trainer / wrapper checkpoint:
+        #   model.safetensors
+        #   trainer_state.json
+        #   optimizer.pt / scheduler.pt
+        #   但没有 adapter_config.json
         if len(weight_files) > 0:
             _rank0_print("[ckpt loader] loading raw checkpoint weights:")
             for wf in weight_files:
@@ -558,6 +591,8 @@ def build_model_and_tokenizer(args, device_map):
             del raw_state_dict
             torch.cuda.empty_cache()
 
+        # Case 3:
+        # 普通完整 HF model directory。
         else:
             _rank0_print("[ckpt loader] no raw weight file found; fallback to AutoModelForCausalLM.from_pretrained")
 
@@ -754,11 +789,6 @@ def unwrap_modules_to_save_embedding(module):
     if original_module is not None and hasattr(original_module, "weight"):
         return original_module
 
-    base_layer = getattr(module, "base_layer", None)
-
-    if base_layer is not None and hasattr(base_layer, "weight"):
-        return base_layer
-
     child = getattr(module, "module", None)
 
     if child is not None and child is not module:
@@ -772,7 +802,7 @@ def unwrap_modules_to_save_embedding(module):
 
 def get_model_input_embeddings(model):
     """
-    兼容普通 HF model 和 PEFT / LoRA model。
+    兼容普通 HF model 和 PEFT/Lora model。
     返回真正的 embedding module。
     """
     if hasattr(model, "get_input_embeddings"):
@@ -796,8 +826,7 @@ def get_model_input_embeddings(model):
 def model_next_logits_no_cache(model, inputs_embeds, attention_mask):
     """
     no-cache forward。
-
-    不传 past_key_values，避免 Qwen3 / Transformers 新 Cache API 和 tuple cache 不兼容。
+    输入完整 hidden prefix，返回最后一个位置预测下一个 token 的 logits。
     """
     outputs = model(
         inputs_embeds=inputs_embeds,
@@ -819,10 +848,18 @@ def predict_soft_coarse_embedding(
     use_coarse_score,
 ):
     """
-    coarse logits -> soft coarse embedding。
+    推理阶段：
+      coarse logits -> soft coarse embedding
 
-    coarse token 不解码成文本，只在当前 coarse codebook 上 softmax，
-    然后对 embedding 做加权求和。
+    coarse 不解码成文本，不作为显式 token 输出。
+    只在当前 coarse codebook 上做 softmax，然后对 embedding 加权求和。
+
+    next_logits: [B, vocab_size]
+    coarse_token_ids: 当前 coarse 位置允许的 coarse token id 列表
+
+    return:
+      soft_coarse_emb: [B, hidden_size]
+      coarse_score: [B]
     """
     ids = torch.tensor(
         coarse_token_ids,
@@ -866,18 +903,18 @@ def batch_generate_latent_interleaved_qwen(
     use_coarse_score_in_rank: bool = False,
 ):
     """
-    no-cache 隐式交错推理。
+    简单 no-cache 隐式交错推理。
 
     每个 fine code 位置执行：
-
       context
       -> coarse logits
       -> soft coarse embedding
       -> fine logits
       -> select fine token
-      -> append soft coarse embedding + fine embedding to context
+      -> append soft coarse emb + fine emb to context
 
     输出只 decode fine tokens。
+    coarse tokens 永远不作为文本输出。
     """
     device = inputs["input_ids"].device
     input_ids = inputs["input_ids"]
@@ -934,10 +971,7 @@ def batch_generate_latent_interleaved_qwen(
 
             if extra_embeds.size(0) > 0:
                 full_embeds = torch.cat(
-                    [
-                        sample_prompt_embeds,
-                        extra_embeds,
-                    ],
+                    [sample_prompt_embeds, extra_embeds],
                     dim=0,
                 )
 
@@ -948,10 +982,7 @@ def batch_generate_latent_interleaved_qwen(
                 )
 
                 full_attention = torch.cat(
-                    [
-                        sample_prompt_mask,
-                        extra_attention,
-                    ],
+                    [sample_prompt_mask, extra_attention],
                     dim=0,
                 )
 
@@ -965,12 +996,14 @@ def batch_generate_latent_interleaved_qwen(
         full_inputs_embeds = torch.stack(full_embeds_list, dim=0)
         full_attention_mask = torch.stack(full_attention_list, dim=0)
 
+        # 1. 当前 context 预测隐式 coarse。
         coarse_logits = model_next_logits_no_cache(
             model=model,
             inputs_embeds=full_inputs_embeds,
             attention_mask=full_attention_mask,
         )
 
+        # 2. coarse logits 转为 soft coarse embedding。
         coarse_pos = min(step_idx, len(coarse_position_token_ids) - 1)
         coarse_ids_this_pos = coarse_position_token_ids[coarse_pos]
 
@@ -985,11 +1018,9 @@ def batch_generate_latent_interleaved_qwen(
             use_coarse_score=use_coarse_score_in_rank,
         )
 
+        # 3. context + soft coarse embedding 预测显式 fine token。
         inputs_after_coarse = torch.cat(
-            [
-                full_inputs_embeds,
-                coarse_embeds.unsqueeze(1),
-            ],
+            [full_inputs_embeds, coarse_embeds.unsqueeze(1)],
             dim=1,
         )
 
@@ -1000,10 +1031,7 @@ def batch_generate_latent_interleaved_qwen(
         )
 
         attention_after_coarse = torch.cat(
-            [
-                full_attention_mask,
-                ones,
-            ],
+            [full_attention_mask, ones],
             dim=1,
         )
 
@@ -1059,6 +1087,8 @@ def batch_generate_latent_interleaved_qwen(
 
                 fine_emb = embedding_weight[fine_token_id].unsqueeze(0)
 
+                # 下一步 context 追加：
+                # soft coarse embedding + selected fine embedding
                 new_extra_embeds = torch.cat(
                     [
                         beam["extra_embeds"],
@@ -1145,7 +1175,6 @@ def batch_generate_latent_interleaved_qwen(
                 beam["fine_token_ids"],
                 skip_special_tokens=True,
             )
-
             decoded.append(normalize_code_text(text))
             scores.append(float(beam["score"]))
 
@@ -1303,12 +1332,12 @@ def test_ddp(args):
     all_pairs_rank0 = []
     all_txt_lines_rank0 = []
 
-    amp_dtype = None
-
     if getattr(args, "use_bf16", False) or getattr(args, "bf16", False):
         amp_dtype = torch.bfloat16
     elif getattr(args, "use_fp16", False) or getattr(args, "fp16", False):
         amp_dtype = torch.float16
+    else:
+        amp_dtype = None
 
     with torch.inference_mode():
         for prompt_id in prompt_ids:
@@ -1345,7 +1374,6 @@ def test_ddp(args):
                                 coarse_temperature=args.interleaved_temperature,
                                 use_coarse_score_in_rank=args.use_coarse_score_in_rank,
                             )
-
                     else:
                         decoded, scores = batch_generate_latent_interleaved_qwen(
                             model=model,
@@ -1358,7 +1386,6 @@ def test_ddp(args):
                             coarse_temperature=args.interleaved_temperature,
                             use_coarse_score_in_rank=args.use_coarse_score_in_rank,
                         )
-
                 else:
                     decoded, scores = run_vanilla_generate(
                         model=model,
@@ -1444,7 +1471,7 @@ def test_ddp(args):
                         }
                         pbar.set_postfix(temp)
 
-                    if (step + 1) % 50 == 0 and total > 0:
+                    if (step + 1) % 50 == 0:
                         print(
                             {
                                 m: metrics_results[m] / total
@@ -1595,13 +1622,12 @@ if __name__ == "__main__":
 
     parser = parse_global_args(parser)
 
-    # 这里调用 utils.py 里的训练参数解析，主要是为了复用其中的 LoRA 参数：
+    # 复用 utils.py 中训练时的 LoRA 参数，保持和 lora_finetune.py 一致：
     # --lora_r
     # --lora_alpha
     # --lora_dropout
     # --lora_target_modules
     # --lora_modules_to_save
-    # 这些参数和 lora_finetune.py 训练时保持一致。
     parser = parse_train_args(parser)
 
     parser = parse_dataset_args(parser)
@@ -1611,8 +1637,3 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     test_ddp(args)
-
-
-
-
-

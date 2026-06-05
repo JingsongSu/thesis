@@ -1,4 +1,4 @@
-from typing import List, Optional, Tuple
+vfrom typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -19,32 +19,86 @@ def _to_list(x):
 
 class InterleavedLatentQwen(nn.Module):
     """
-    Simple teacher-forced implicit interleaved wrapper for HoloRec-Qwen.
+    TIGER-style latent coarse-to-fine wrapper for HoloRec-Qwen.
 
-    Core design:
+    Goal:
+        Make HoloRec-Qwen training closer to HoloRec-TIGER:
 
-    Visible sequence:
-        fine_1, fine_2, fine_3, ...
+            coarse_loss:
+                context -> coarse token CE
 
-    Hidden training input embedding sequence:
-        prompt,
-        gold_coarse_1_emb, gold_fine_1_emb,
-        gold_coarse_2_emb, gold_fine_2_emb,
-        ...
+            fine_loss:
+                context -> predicted soft coarse embedding -> fine token CE
 
-    Loss positions:
-        prompt last hidden state predicts coarse_1
-        coarse_1 position predicts fine_1
-        fine_1 position predicts coarse_2
-        coarse_2 position predicts fine_2
-        ...
+            coarse_align_loss:
+                predicted soft coarse embedding aligns to gold coarse embedding
 
     Important:
         - coarse tokens are never visible text tokens.
-        - coarse tokens are inserted only as embeddings.
-        - fine tokens are the explicit recommendation code tokens.
-        - training uses gold coarse embedding, like teacher forcing.
-        - inference should use predicted soft coarse embedding.
+        - fine tokens are the final recommendation code tokens.
+        - gold coarse embedding is NOT directly used to predict fine.
+        - gold coarse is used as:
+            1. target for coarse CE;
+            2. target for coarse embedding alignment.
+        - fine loss uses predicted soft coarse embedding, matching inference.
+
+    Training path:
+
+        Pass 1:
+            input:
+                prompt, gold_fine_1, gold_fine_2, ...
+
+            prediction positions:
+                prompt last hidden       -> coarse_1
+                gold_fine_1 hidden       -> coarse_2
+                gold_fine_2 hidden       -> coarse_3
+                ...
+
+            outputs:
+                coarse_logits
+                predicted_soft_coarse_embeds
+
+            losses:
+                coarse_loss
+                coarse_align_loss
+
+        Pass 2:
+            input:
+                prompt,
+                predicted_soft_coarse_1, gold_fine_1,
+                predicted_soft_coarse_2, gold_fine_2,
+                ...
+
+            prediction positions:
+                predicted_soft_coarse_1 position -> fine_1
+                predicted_soft_coarse_2 position -> fine_2
+                ...
+
+            loss:
+                fine_loss
+
+    Total loss:
+        loss =
+            coarse_loss_weight * coarse_loss
+          + fine_loss_weight * fine_loss
+          + coarse_align_weight * coarse_align_loss
+
+    Compared with the old first-version teacher-forced path:
+        old:
+            gold coarse emb -> fine CE
+
+        this version:
+            predicted soft coarse emb -> fine CE
+
+    Compared with the previous fast hidden-fusion path:
+        old fast:
+            hidden + coarse_emb -> lm_head -> fine
+
+        this version:
+            context + coarse_emb -> Qwen -> fine
+
+    This is slower than one-pass hidden fusion, but much more aligned with
+    inference, while still much faster than step-by-step exact rollout.
     """
 
     def __init__(
@@ -54,8 +108,9 @@ class InterleavedLatentQwen(nn.Module):
         temperature: float = 1.0,
         coarse_loss_weight: float = 1.0,
         fine_loss_weight: float = 1.0,
-        coarse_align_weight: float = 0.0,
+        coarse_align_weight: float = 1.0,
         use_train_cache: bool = False,
+        align_loss_type: str = "mse_cosine",
         **kwargs,
     ):
         super().__init__()
@@ -63,18 +118,15 @@ class InterleavedLatentQwen(nn.Module):
         self.base_model = base_model
         self.pad_token_id = int(pad_token_id)
 
-        # temperature is kept for compatibility with old lora_finetune.py.
-        # It is mainly used at inference when converting coarse logits to soft emb.
         self.temperature = float(temperature)
 
         self.coarse_loss_weight = float(coarse_loss_weight)
         self.fine_loss_weight = float(fine_loss_weight)
-
-        # In this simplified teacher-forced version we do not need alignment loss,
-        # because training directly inserts gold coarse embeddings.
         self.coarse_align_weight = float(coarse_align_weight)
 
-        # Kept only for compatibility with current lora_finetune.py.
+        self.align_loss_type = str(align_loss_type)
+
+        # Kept only for compatibility with lora_finetune.py.
         # This wrapper intentionally does not use KV cache during training.
         self.use_train_cache = False
 
@@ -82,6 +134,8 @@ class InterleavedLatentQwen(nn.Module):
 
         self.coarse_position_token_ids: Optional[List[List[int]]] = None
         self._coarse_codebook_cache = {}
+
+        self.last_loss_dict = {}
 
     def set_codebooks(self, coarse_position_token_ids: List[List[int]]):
         if coarse_position_token_ids is None or len(coarse_position_token_ids) == 0:
@@ -101,8 +155,8 @@ class InterleavedLatentQwen(nn.Module):
         return None
 
     def gradient_checkpointing_enable(self, *args, **kwargs):
-        # For this wrapper, gradient checkpointing is not necessary and can make
-        # repeated embedding-input logic harder to debug. Keep it disabled.
+        # This wrapper runs the inner model twice in one forward.
+        # Gradient checkpointing can cause repeated-reduction issues with DDP/ZeRO.
         if hasattr(self.base_model, "gradient_checkpointing_disable"):
             return self.base_model.gradient_checkpointing_disable()
         return None
@@ -126,10 +180,11 @@ class InterleavedLatentQwen(nn.Module):
         if module is None:
             raise AttributeError("Input embedding module is None.")
 
-        if hasattr(module, "weight"):
+        if hasattr(module, "weight") and callable(getattr(module, "forward", None)):
             return module
 
         modules_to_save = getattr(module, "modules_to_save", None)
+
         if modules_to_save is not None:
             active_names = []
 
@@ -152,28 +207,40 @@ class InterleavedLatentQwen(nn.Module):
 
             seen = set()
             clean_names = []
+
             for name in active_names:
                 if name is None:
                     continue
+
                 name = str(name)
+
                 if name in seen:
                     continue
+
                 seen.add(name)
                 clean_names.append(name)
 
             for name in clean_names:
                 if name in modules_to_save:
                     candidate = modules_to_save[name]
-                    if hasattr(candidate, "weight"):
+                    if hasattr(candidate, "weight") and callable(
+                        getattr(candidate, "forward", None)
+                    ):
                         return candidate
 
             for _, candidate in modules_to_save.items():
-                if hasattr(candidate, "weight"):
+                if hasattr(candidate, "weight") and callable(
+                    getattr(candidate, "forward", None)
+                ):
                     return candidate
 
         original_module = getattr(module, "original_module", None)
         if original_module is not None and hasattr(original_module, "weight"):
             return original_module
+
+        base_layer = getattr(module, "base_layer", None)
+        if base_layer is not None and hasattr(base_layer, "weight"):
+            return base_layer
 
         child = getattr(module, "module", None)
         if child is not None and child is not module:
@@ -208,8 +275,10 @@ class InterleavedLatentQwen(nn.Module):
             )
 
         key = (int(pos), str(device))
+
         if key not in self._coarse_codebook_cache:
             ids = self.coarse_position_token_ids[pos]
+
             if len(ids) == 0:
                 raise ValueError(f"Empty coarse codebook at position {pos}.")
 
@@ -221,7 +290,22 @@ class InterleavedLatentQwen(nn.Module):
 
         return self._coarse_codebook_cache[key]
 
-    def _build_interleaved_inputs(
+    def _base_forward_logits(
+        self,
+        inputs_embeds: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        outputs = self.base_model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            use_cache=False,
+            return_dict=True,
+            output_attentions=False,
+            output_hidden_states=False,
+        )
+        return outputs.logits
+
+    def _build_fine_only_inputs(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
@@ -229,29 +313,26 @@ class InterleavedLatentQwen(nn.Module):
         coarse_labels: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Build teacher-forced implicit interleaved embedding sequence.
+        Build pass-1 teacher-forced input:
 
-        Input:
-            input_ids:      [B, P]
-            attention_mask: [B, P]
-            fine_labels:    [B, L]
-            coarse_labels:  [B, L]
+            prompt, gold_fine_1, gold_fine_2, ...
 
-        Output:
-            inputs_embeds:
-                [B, P + 2L, H]
-                prompt + coarse_1_emb + fine_1_emb + ...
+        This pass predicts coarse tokens.
 
-            full_attention_mask:
-                [B, P + 2L]
+        For sequence:
+            prompt, f1, f2, f3, ...
 
-            valid_code_mask:
-                [B, L]
+        Causal logits positions for coarse:
+            prompt last position -> coarse_1
+            f1 position          -> coarse_2
+            f2 position          -> coarse_3
+            ...
+
+        Return:
+            inputs_embeds:       [B, P + L, H]
+            full_attention_mask: [B, P + L]
+            valid_code_mask:     [B, L]
         """
-        batch_size, code_len = fine_labels.shape
-
-        prompt_embeds = self._embed_token_ids(input_ids)
-
         valid_code_mask = (
             fine_labels.ne(IGNORE_INDEX)
             & coarse_labels.ne(IGNORE_INDEX)
@@ -261,26 +342,17 @@ class InterleavedLatentQwen(nn.Module):
             ~valid_code_mask,
             self.pad_token_id,
         )
-        safe_coarse_ids = coarse_labels.masked_fill(
-            ~valid_code_mask,
-            self.pad_token_id,
-        )
 
+        prompt_embeds = self._embed_token_ids(input_ids)
         fine_embeds = self._embed_token_ids(safe_fine_ids)
-        coarse_embeds = self._embed_token_ids(safe_coarse_ids)
 
         pieces = [prompt_embeds]
         attn_pieces = [attention_mask]
 
+        code_len = fine_labels.size(1)
+
         for pos in range(code_len):
             valid = valid_code_mask[:, pos:pos + 1].to(dtype=attention_mask.dtype)
-
-            # coarse is implicit: inserted as embedding only
-            pieces.append(coarse_embeds[:, pos:pos + 1, :])
-            attn_pieces.append(valid)
-
-            # fine is explicit token, but during training we feed its embedding
-            # as normal teacher forcing.
             pieces.append(fine_embeds[:, pos:pos + 1, :])
             attn_pieces.append(valid)
 
@@ -289,42 +361,117 @@ class InterleavedLatentQwen(nn.Module):
 
         return inputs_embeds, full_attention_mask, valid_code_mask
 
-    def _gather_interleaved_logits(
+    def _gather_coarse_logits_from_fine_only(
         self,
         logits: torch.Tensor,
         prompt_len: int,
         code_len: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """
-        For sequence:
-            prompt, c1, f1, c2, f2, ...
+        For pass-1 sequence:
+            prompt, f1, f2, f3, ...
 
-        Causal LM logits at position t predict position t+1.
+        Coarse prediction positions:
+            coarse_1 predicted at prompt last: prompt_len - 1
+            coarse_2 predicted at f1:          prompt_len
+            coarse_3 predicted at f2:          prompt_len + 1
+            ...
 
-        Therefore:
-            coarse_i is predicted at:
-                i=0: prompt_len - 1
-                i>0: previous fine position
-
-            fine_i is predicted at:
-                coarse_i position
+        So:
+            coarse_predict_positions = prompt_len - 1 + pos
         """
         device = logits.device
         pos = torch.arange(code_len, dtype=torch.long, device=device)
 
-        coarse_predict_positions = (prompt_len - 1) + 2 * pos
-        fine_predict_positions = prompt_len + 2 * pos
+        coarse_predict_positions = (prompt_len - 1) + pos
 
         coarse_logits = logits.index_select(
             dim=1,
             index=coarse_predict_positions,
         )
+
+        return coarse_logits
+
+    def _build_predicted_interleaved_inputs(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        predicted_coarse_embeds: torch.Tensor,
+        fine_labels: torch.Tensor,
+        valid_code_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Build pass-2 input:
+
+            prompt,
+            predicted_soft_coarse_1_emb, gold_fine_1_emb,
+            predicted_soft_coarse_2_emb, gold_fine_2_emb,
+            ...
+
+        This pass predicts fine tokens at predicted_soft_coarse positions.
+
+        This is the Qwen counterpart of TIGER-style:
+            predicted soft coarse emb -> fine CE
+        """
+        prompt_embeds = self._embed_token_ids(input_ids)
+
+        safe_fine_ids = fine_labels.masked_fill(
+            ~valid_code_mask,
+            self.pad_token_id,
+        )
+        fine_embeds = self._embed_token_ids(safe_fine_ids)
+
+        pieces = [prompt_embeds]
+        attn_pieces = [attention_mask]
+
+        code_len = fine_labels.size(1)
+
+        for pos in range(code_len):
+            valid = valid_code_mask[:, pos:pos + 1].to(dtype=attention_mask.dtype)
+
+            pieces.append(predicted_coarse_embeds[:, pos:pos + 1, :])
+            attn_pieces.append(valid)
+
+            pieces.append(fine_embeds[:, pos:pos + 1, :])
+            attn_pieces.append(valid)
+
+        inputs_embeds = torch.cat(pieces, dim=1)
+        full_attention_mask = torch.cat(attn_pieces, dim=1)
+
+        return inputs_embeds, full_attention_mask
+
+    def _gather_fine_logits_from_interleaved(
+        self,
+        logits: torch.Tensor,
+        prompt_len: int,
+        code_len: int,
+    ) -> torch.Tensor:
+        """
+        For pass-2 sequence:
+            prompt, c1, f1, c2, f2, ...
+
+        Causal LM logits at position t predict position t+1.
+
+        fine_i is predicted at c_i position:
+            c1 position = prompt_len
+            c2 position = prompt_len + 2
+            c3 position = prompt_len + 4
+            ...
+
+        So:
+            fine_predict_positions = prompt_len + 2 * pos
+        """
+        device = logits.device
+        pos = torch.arange(code_len, dtype=torch.long, device=device)
+
+        fine_predict_positions = prompt_len + 2 * pos
+
         fine_logits = logits.index_select(
             dim=1,
             index=fine_predict_positions,
         )
 
-        return coarse_logits, fine_logits
+        return fine_logits
 
     def _coarse_loss(
         self,
@@ -364,7 +511,7 @@ class InterleavedLatentQwen(nn.Module):
             if not valid.any():
                 continue
 
-            target_pos = matches.float().argmax(dim=1).long()
+            target_pos = matches.long().argmax(dim=1)
 
             ce = F.cross_entropy(
                 codebook_logits[valid].float(),
@@ -401,6 +548,139 @@ class InterleavedLatentQwen(nn.Module):
 
         return ce.to(dtype=fine_logits.dtype), valid.sum().to(dtype=fine_logits.dtype)
 
+    def _predicted_soft_coarse_embeddings(
+        self,
+        coarse_logits: torch.Tensor,
+        valid_code_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Convert predicted coarse logits to soft coarse embeddings.
+
+        Input:
+            coarse_logits:   [B, L, V]
+            valid_code_mask: [B, L]
+
+        Output:
+            predicted_coarse_embeds: [B, L, H]
+
+        For each position pos:
+            coarse_logits[:, pos, current_coarse_codebook]
+            -> softmax with temperature
+            -> weighted sum over current coarse token embeddings.
+
+        This is consistent with Qwen test-time inference, which uses the
+        current position's coarse codebook.
+        """
+        batch_size, code_len, _ = coarse_logits.shape
+        embedding_weight = self._get_embedding_weight()
+
+        pad_ids = torch.full(
+            (batch_size,),
+            fill_value=self.pad_token_id,
+            dtype=torch.long,
+            device=coarse_logits.device,
+        )
+        pad_emb = self._embed_token_ids(pad_ids).to(dtype=embedding_weight.dtype)
+
+        predicted_embeds = []
+
+        for pos in range(code_len):
+            codebook_ids = self._get_codebook_tensor(pos, coarse_logits.device)
+
+            codebook_logits = coarse_logits[:, pos, :].index_select(
+                dim=-1,
+                index=codebook_ids,
+            )
+
+            probs = F.softmax(
+                codebook_logits.float() / max(float(self.temperature), 1e-6),
+                dim=-1,
+            ).to(dtype=embedding_weight.dtype)
+
+            codebook_embeds = embedding_weight.index_select(
+                dim=0,
+                index=codebook_ids,
+            ).to(dtype=probs.dtype)
+
+            soft_coarse_emb = probs @ codebook_embeds
+
+            valid_pos = valid_code_mask[:, pos].to(dtype=torch.bool)
+
+            soft_coarse_emb = torch.where(
+                valid_pos.unsqueeze(-1),
+                soft_coarse_emb,
+                pad_emb,
+            )
+
+            predicted_embeds.append(soft_coarse_emb)
+
+        return torch.stack(predicted_embeds, dim=1)
+
+    def _gold_coarse_embeddings(
+        self,
+        coarse_labels: torch.Tensor,
+        valid_code_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        safe_coarse_ids = coarse_labels.masked_fill(
+            ~valid_code_mask,
+            self.pad_token_id,
+        )
+        return self._embed_token_ids(safe_coarse_ids)
+
+    def _coarse_align_loss(
+        self,
+        predicted_coarse_embeds: torch.Tensor,
+        gold_coarse_embeds: torch.Tensor,
+        valid_code_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Align predicted soft coarse embeddings to gold coarse embeddings.
+
+        predicted_coarse_embeds: [B, L, H]
+        gold_coarse_embeds:      [B, L, H]
+        valid_code_mask:         [B, L]
+
+        Returns:
+            loss_sum, count
+        """
+        valid = valid_code_mask.to(dtype=torch.bool)
+
+        if not valid.any():
+            return (
+                predicted_coarse_embeds.new_zeros(()),
+                predicted_coarse_embeds.new_zeros(()),
+            )
+
+        pred = predicted_coarse_embeds[valid].float()
+        gold = gold_coarse_embeds[valid].float()
+
+        loss_sum = predicted_coarse_embeds.new_zeros(())
+
+        align_type = self.align_loss_type.lower()
+
+        if align_type in ["mse", "mse_only"]:
+            mse = F.mse_loss(pred, gold, reduction="none").mean(dim=-1)
+            loss_sum = mse.sum().to(dtype=predicted_coarse_embeds.dtype)
+
+        elif align_type in ["cos", "cosine", "cosine_only"]:
+            cos_loss = 1.0 - F.cosine_similarity(pred, gold, dim=-1)
+            loss_sum = cos_loss.sum().to(dtype=predicted_coarse_embeds.dtype)
+
+        elif align_type in ["mse_cosine", "cosine_mse", "mse+cosine"]:
+            mse = F.mse_loss(pred, gold, reduction="none").mean(dim=-1)
+            cos_loss = 1.0 - F.cosine_similarity(pred, gold, dim=-1)
+            loss_sum = (mse + cos_loss).sum().to(dtype=predicted_coarse_embeds.dtype)
+
+        else:
+            raise ValueError(
+                f"Unknown align_loss_type: {self.align_loss_type}. "
+                "Supported: mse, cosine, mse_cosine."
+            )
+
+        count = valid.sum().to(dtype=predicted_coarse_embeds.dtype)
+
+        return loss_sum, count
+
     def forward(
         self,
         input_ids=None,
@@ -412,6 +692,9 @@ class InterleavedLatentQwen(nn.Module):
     ):
         if input_ids is None:
             raise ValueError("input_ids must be provided.")
+
+        if fine_labels is None and labels is not None:
+            fine_labels = labels
 
         if fine_labels is None or coarse_labels is None:
             raise ValueError(
@@ -430,22 +713,31 @@ class InterleavedLatentQwen(nn.Module):
         prompt_len = input_ids.size(1)
         code_len = fine_labels.size(1)
 
-        inputs_embeds, full_attention_mask, valid_code_mask = self._build_interleaved_inputs(
+        # ------------------------------------------------------------------
+        # Pass 1:
+        #   prompt + gold_fine
+        #   -> coarse logits
+        #   -> predicted soft coarse embeddings
+        #   -> coarse CE + coarse alignment
+        # ------------------------------------------------------------------
+        (
+            fine_only_inputs_embeds,
+            fine_only_attention_mask,
+            valid_code_mask,
+        ) = self._build_fine_only_inputs(
             input_ids=input_ids,
             attention_mask=attention_mask,
             fine_labels=fine_labels,
             coarse_labels=coarse_labels,
         )
 
-        outputs = self.base_model(
-            inputs_embeds=inputs_embeds,
-            attention_mask=full_attention_mask,
-            use_cache=False,
-            return_dict=True,
+        fine_only_logits = self._base_forward_logits(
+            inputs_embeds=fine_only_inputs_embeds,
+            attention_mask=fine_only_attention_mask,
         )
 
-        coarse_logits, fine_logits = self._gather_interleaved_logits(
-            logits=outputs.logits,
+        coarse_logits = self._gather_coarse_logits_from_fine_only(
+            logits=fine_only_logits,
             prompt_len=prompt_len,
             code_len=code_len,
         )
@@ -455,20 +747,88 @@ class InterleavedLatentQwen(nn.Module):
             coarse_labels=coarse_labels,
         )
 
+        predicted_coarse_embeds = self._predicted_soft_coarse_embeddings(
+            coarse_logits=coarse_logits,
+            valid_code_mask=valid_code_mask,
+        )
+
+        gold_coarse_embeds = self._gold_coarse_embeddings(
+            coarse_labels=coarse_labels,
+            valid_code_mask=valid_code_mask,
+        )
+
+        coarse_align_loss_sum, coarse_align_count = self._coarse_align_loss(
+            predicted_coarse_embeds=predicted_coarse_embeds,
+            gold_coarse_embeds=gold_coarse_embeds,
+            valid_code_mask=valid_code_mask,
+        )
+
+        # ------------------------------------------------------------------
+        # Pass 2:
+        #   prompt + predicted_soft_coarse + gold_fine
+        #   -> fine logits
+        #   -> fine CE
+        # ------------------------------------------------------------------
+        pred_inputs_embeds, pred_attention_mask = (
+            self._build_predicted_interleaved_inputs(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                predicted_coarse_embeds=predicted_coarse_embeds,
+                fine_labels=fine_labels,
+                valid_code_mask=valid_code_mask,
+            )
+        )
+
+        pred_logits = self._base_forward_logits(
+            inputs_embeds=pred_inputs_embeds,
+            attention_mask=pred_attention_mask,
+        )
+
+        fine_logits = self._gather_fine_logits_from_interleaved(
+            logits=pred_logits,
+            prompt_len=prompt_len,
+            code_len=code_len,
+        )
+
         fine_loss_sum, fine_count = self._fine_loss(
             fine_logits=fine_logits,
             fine_labels=fine_labels,
         )
 
-        loss = coarse_loss_sum.float() * 0.0
-
-        loss = loss + self.coarse_loss_weight * (
-            coarse_loss_sum.float() / coarse_count.float().clamp_min(1.0)
+        coarse_loss = (
+            coarse_loss_sum.float()
+            / coarse_count.float().clamp_min(1.0)
+        )
+        fine_loss = (
+            fine_loss_sum.float()
+            / fine_count.float().clamp_min(1.0)
+        )
+        coarse_align_loss = (
+            coarse_align_loss_sum.float()
+            / coarse_align_count.float().clamp_min(1.0)
         )
 
-        loss = loss + self.fine_loss_weight * (
-            fine_loss_sum.float() / fine_count.float().clamp_min(1.0)
-        )
+        loss = coarse_loss * 0.0
+        loss = loss + self.coarse_loss_weight * coarse_loss
+        loss = loss + self.fine_loss_weight * fine_loss
+        loss = loss + self.coarse_align_weight * coarse_align_loss
+
+        self.last_loss_dict = {
+            "coarse_loss": float(coarse_loss.detach().float().cpu()),
+            "fine_loss": float(fine_loss.detach().float().cpu()),
+            "coarse_align_loss": float(coarse_align_loss.detach().float().cpu()),
+            "coarse_count": float(coarse_count.detach().float().cpu()),
+            "fine_count": float(fine_count.detach().float().cpu()),
+            "coarse_align_count": float(
+                coarse_align_count.detach().float().cpu()
+            ),
+            "coarse_loss_weight": float(self.coarse_loss_weight),
+            "fine_loss_weight": float(self.fine_loss_weight),
+            "coarse_align_weight": float(self.coarse_align_weight),
+            "temperature": float(self.temperature),
+            "align_loss_type": self.align_loss_type,
+            "mode": "tiger_style_qwen_two_pass",
+        }
 
         return CausalLMOutputWithPast(
             loss=loss,
@@ -477,6 +837,3 @@ class InterleavedLatentQwen(nn.Module):
             hidden_states=None,
             attentions=None,
         )
-
-
-

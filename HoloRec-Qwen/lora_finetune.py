@@ -1,5 +1,6 @@
 import argparse
 import inspect
+import math
 import os
 import sys
 
@@ -74,29 +75,178 @@ def patch_transformers_peft_detection_for_latent_wrapper():
 
         trainer_mod._is_peft_model = _is_peft_model_or_contains_peft
         trainer_utils_mod._is_peft_model = _is_peft_model_or_contains_peft
+
     except Exception as e:
         print("[warning] failed to patch Trainer PEFT detection:", repr(e))
 
 
 class HoloRecTrainer(transformers.Trainer):
     """
-    Fix for HoloRec-Qwen eval_loss missing.
+    Custom Trainer for HoloRec-Qwen.
 
-    Why this is needed:
-    - The batch uses fine_labels/coarse_labels instead of the standard labels.
-    - Some transformers versions do not treat these fields as labels during eval.
-    - Then evaluation returns only eval_runtime / speed metrics.
-    - load_best_model_at_end=True then looks for eval_loss and crashes.
-
-    This trainer explicitly computes eval loss from model(**inputs) when the
-    HoloRec label fields exist.
+    Adds:
+    - stable eval_loss computation for fine_labels/coarse_labels
+    - train-time logging of weighted sub-losses:
+        loss/coarse_weighted
+        loss/fine_weighted
+        loss/coarse_align_weighted
     """
 
     holo_label_names = ["fine_labels", "coarse_labels"]
 
+    loss_component_keys = [
+        "weighted_coarse_loss",
+        "weighted_fine_loss",
+        "weighted_coarse_align_loss",
+        "weighted_loss_sum",
+        "coarse_loss",
+        "fine_loss",
+        "coarse_align_loss",
+    ]
+
+    loss_log_name_map = {
+        "weighted_coarse_loss": "loss/coarse_weighted",
+        "weighted_fine_loss": "loss/fine_weighted",
+        "weighted_coarse_align_loss": "loss/coarse_align_weighted",
+        "weighted_loss_sum": "loss/weighted_sum_from_parts",
+        "coarse_loss": "loss/coarse_raw",
+        "fine_loss": "loss/fine_raw",
+        "coarse_align_loss": "loss/coarse_align_raw",
+    }
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.label_names = list(self.holo_label_names)
+        self._loss_component_sums = {}
+        self._loss_component_count = 0
+
+    @staticmethod
+    def _unwrap_model(model):
+        """
+        Get the real model object from common wrappers such as DDP.
+        """
+        unwrapped = model
+        seen = set()
+
+        while True:
+            changed = False
+            for attr in ("module", "_orig_mod"):
+                inner = getattr(unwrapped, attr, None)
+                if inner is not None and id(inner) not in seen:
+                    seen.add(id(unwrapped))
+                    unwrapped = inner
+                    changed = True
+                    break
+            if not changed:
+                break
+
+        return unwrapped
+
+    def _get_last_loss_dict(self, model):
+        unwrapped = self._unwrap_model(model)
+        loss_dict = getattr(unwrapped, "last_loss_dict", None)
+
+        if isinstance(loss_dict, dict):
+            return loss_dict
+
+        return {}
+
+    def _accumulate_loss_components(self, model):
+        loss_dict = self._get_last_loss_dict(model)
+        if not loss_dict:
+            return
+
+        added_any = False
+
+        for key in self.loss_component_keys:
+            value = loss_dict.get(key, None)
+            if value is None:
+                continue
+
+            try:
+                value = float(value)
+            except Exception:
+                continue
+
+            if not math.isfinite(value):
+                continue
+
+            self._loss_component_sums[key] = (
+                self._loss_component_sums.get(key, 0.0) + value
+            )
+            added_any = True
+
+        if added_any:
+            self._loss_component_count += 1
+
+    def _pop_mean_loss_components(self):
+        if self._loss_component_count <= 0:
+            return {}
+
+        count = float(self._loss_component_count)
+        means = {}
+
+        for key, value_sum in self._loss_component_sums.items():
+            log_name = self.loss_log_name_map.get(key, key)
+            means[log_name] = value_sum / count
+
+        self._loss_component_sums = {}
+        self._loss_component_count = 0
+
+        return means
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        """
+        During training, call the normal Trainer compute_loss and then read
+        model.last_loss_dict produced by InterleavedLatentQwen.forward().
+
+        The accumulated values are averaged and attached to normal Trainer logs
+        inside self.log().
+        """
+        try:
+            result = super().compute_loss(
+                model,
+                inputs,
+                return_outputs=return_outputs,
+                **kwargs,
+            )
+        except TypeError as exc:
+            # Older transformers versions do not accept newer kwargs such as
+            # num_items_in_batch.
+            msg = str(exc)
+            if kwargs and (
+                "unexpected keyword" in msg
+                or "got an unexpected" in msg
+                or "unexpected keyword argument" in msg
+            ):
+                result = super().compute_loss(
+                    model,
+                    inputs,
+                    return_outputs=return_outputs,
+                )
+            else:
+                raise
+
+        # Only accumulate train loss components, not eval components.
+        if getattr(model, "training", False):
+            self._accumulate_loss_components(model)
+
+        return result
+
+    def log(self, logs, *args, **kwargs):
+        """
+        Merge averaged sub-losses into the regular train log record.
+
+        This means they appear in stdout / tensorboard / wandb with the same
+        cadence as --logging_step.
+        """
+        if isinstance(logs, dict) and "loss" in logs:
+            component_logs = self._pop_mean_loss_components()
+            if component_logs:
+                logs = dict(logs)
+                logs.update(component_logs)
+
+        return super().log(logs, *args, **kwargs)
 
     def prediction_step(
         self,
@@ -141,9 +291,12 @@ class HoloRecTrainer(transformers.Trainer):
         """
         Compatibility guard.
 
-        Normal case: eval_loss exists and the parent Trainer handles best model.
-        Guard case: if a future code path still produces no eval_loss, do not
-        crash checkpoint saving; just skip best-model update for that eval.
+        Normal case:
+            eval_loss exists and the parent Trainer handles best model.
+
+        Guard case:
+            if a future code path still produces no eval_loss, do not crash
+            checkpoint saving; just skip best-model update for that eval.
         """
         if metrics is None:
             metrics = kwargs.get("metrics", None)
@@ -213,9 +366,8 @@ def build_coarse_position_token_ids_from_dataset(dataset, tokenizer):
 
     Returns:
         List[List[int]]
-
-    coarse_position_token_ids[pos] contains all allowed coarse token ids at
-    latent coarse position `pos`.
+        coarse_position_token_ids[pos] contains all allowed coarse token ids
+        at latent coarse position `pos`.
     """
     if not hasattr(dataset, "coarse_indices") or dataset.coarse_indices is None:
         raise ValueError(
@@ -278,7 +430,6 @@ def build_training_args(args, ddp: bool):
     - label_names tells Trainer that fine_labels/coarse_labels are label fields.
     - prediction_loss_only=True avoids gathering huge [B, L, V] logits in eval.
     """
-
     report_to = []
     if getattr(args, "report_to", "wandb") and args.report_to.lower() != "none":
         report_to = [x.strip() for x in args.report_to.split(",") if x.strip()]
@@ -405,7 +556,6 @@ def train(args):
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-
     tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
 
     train_data, valid_data = load_datasets(args)
@@ -532,6 +682,12 @@ def train(args):
         print("temperature:", args.temperature)
         print("use_train_cache:", not args.no_train_cache)
         print("mode: implicit latent interleaved training; coarse tokens are not decoded.")
+        print(
+            "extra train logs: "
+            "loss/coarse_weighted, "
+            "loss/fine_weighted, "
+            "loss/coarse_align_weighted"
+        )
 
     model = InterleavedLatentQwen(
         base_model=peft_model,
@@ -549,6 +705,7 @@ def train(args):
         model.config.use_cache = True
 
     model.gradient_checkpointing_disable()
+
     model = expose_peft_metadata_to_wrapper(model, peft_model)
 
     # Important: call this before constructing Trainer on every DDP rank.

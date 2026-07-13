@@ -67,8 +67,8 @@ def parse_train_args(parser):
     parser.add_argument("--model_max_length", type=int, default=2048)
     parser.add_argument("--weight_decay", type=float, default=0.01)
 
-    parser.add_argument("--lora_r", type=int, default=16)
-    parser.add_argument("--lora_alpha", type=int, default=32)
+    parser.add_argument("--lora_r", type=int, default=8)
+    parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
     parser.add_argument("--lora_target_modules", type=str,
                         default="q_proj,v_proj,k_proj,o_proj,gate_proj,down_proj,up_proj", help="separate by comma")
